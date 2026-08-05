@@ -78,9 +78,42 @@ dependency files mean header edits rebuild their dependents. Every object also
 depends on the Makefile itself, so a compiler-flag change forces a full rebuild
 rather than silently leaving stale objects behind.
 
-`claude.md` records the design invariants that are easy to break — the interrupt
-frame layout, the memory-reservation ordering, the paging reachability rule.
-Worth reading before changing any of those.
+## Design invariants
+
+These are the things that break quietly if you change one half of a pair. Each
+one caused, or would have caused, a real bug.
+
+- **The interrupt frame layout lives in two places.** `struct registers` in
+  `include/cpu/isr.h` is a direct view onto the stack that `src/cpu/isr_stubs.S`
+  builds. Change the push sequence without changing the struct (or the reverse)
+  and every register is silently misreported. Exception and IRQ stubs share one
+  tail — `interrupt_common_stub` — precisely so that layout exists once.
+- **EOI is sent centrally**, in `irq_handler` after the callback returns. An
+  individual IRQ handler must *not* send it, and a line with no handler
+  installed still gets acknowledged — otherwise the PIC never delivers it again.
+- **Physical memory is default-deny.** Every frame starts *used*; only regions
+  the firmware reports available are freed, and the low megabyte, the kernel
+  image and all loader-owned ranges are then taken back. **The reservations must
+  run after the free pass** — the kernel sits inside a region reported as
+  available, so reserving first is silently undone.
+- **Region rounding is asymmetric, and both directions err toward "used".**
+  Freeing rounds the base up and the end down (only wholly-contained frames
+  become free); reserving rounds the base down and the end up (any partially
+  touched frame stays used). Reversing either hands out live memory.
+- **The loader owns memory too.** GRUB and QEMU park module descriptors, the
+  command line and the loader name immediately above the kernel image — exactly
+  where the PMM bitmap would otherwise land.
+- **Everything the kernel must reach after `CR0.PG` has to be inside the
+  identity map**: the bitmap, the page directory, every page table. 4 MiB is the
+  floor, not the answer; the window grows to cover what the allocator has
+  already used.
+- **`CR0.WP` matters even with no ring 3.** Without it the R/W bit is ignored for
+  supervisor accesses, so read-only mappings would be silently writable.
+- **A new page table must be zeroed before it is installed.** `pmm_alloc_block`
+  returns whatever bytes were there, and a stray Present bit maps a garbage
+  frame.
+- **Every object depends on the Makefile itself**, so changing a compiler flag
+  forces a full rebuild instead of leaving stale objects with mismatched ABI.
 
 ## Known limitations
 

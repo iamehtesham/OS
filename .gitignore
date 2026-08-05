@@ -2,6 +2,10 @@
 # dependency files, kernel image and any captured screenshots all live under it.
 build/
 
+# Local working notes, kept out of the published repo. The design invariants it
+# recorded now live in README.md.
+claude.md
+
 # Editor and OS noise
 *.swp
 *~
