@@ -133,13 +133,33 @@ void kfree(void *ptr)
         return;
     }
 
-    /* The predecessor is needed to merge backwards, and the list is singly
-     * linked, so it has to be found by walking. */
-    struct kheap_block *prev = NULL;
+    /* Walking for the predecessor also settles whether this header is in the
+     * list at all, and that answer must not be discarded. The walk can end two
+     * ways -- by finding the block, or by running out -- and on the second exit
+     * `prev` is merely the last node, unrelated to ptr. Merging against it
+     * would splice two blocks that are not neighbours and hand the resulting
+     * oversized block back out.
+     *
+     * The magic check above cannot stand in for this. It reads whatever sits
+     * below the pointer, so a payload that happens to contain the magic word
+     * reads as a live header; only membership proves otherwise. This has to
+     * settle before the write below, which would otherwise land in caller
+     * memory. */
+    struct kheap_block *prev  = NULL;
+    bool                found = false;
 
-    for (struct kheap_block *scan = heap_head; scan != NULL && scan != block;
-         scan = scan->next) {
+    for (struct kheap_block *scan = heap_head; scan != NULL; scan = scan->next) {
+        if (scan == block) {
+            found = true;
+            break;
+        }
+
         prev = scan;
+    }
+
+    if (!found) {
+        kprintf("kfree: %p is not a live block\n", ptr);
+        return;
     }
 
     block->is_free = 1;
