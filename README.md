@@ -47,6 +47,7 @@ directly — no GRUB, no ISO, no disk image is involved.
 | **Keyboard** | PS/2 IRQ1, scancode set 1 → ASCII, make codes only |
 | **Physical memory** | Bitmap allocator over 4 KiB frames, driven by the Multiboot memory map |
 | **Paging** | Two-level page tables, identity-mapped low memory, `CR0.PG` + `CR0.WP` |
+| **Kernel heap** | `kmalloc`/`kfree` over a 1 MiB region at `0xC0000000`: linked list of blocks, first fit, splitting, and coalescing in both directions |
 
 ## Layout
 
@@ -67,6 +68,7 @@ src/drivers/keyboard.c  PS/2 keyboard
 src/mm/pmm.c            physical frame allocator
 src/mm/paging.c         page directory, page tables, map_page
 src/mm/paging_enable.S  loads CR3, sets CR0.PG and CR0.WP
+src/mm/kheap.c          kmalloc / kfree over a linked list of blocks
 src/utils/stdio.c       kprintf
 src/utils/string.c      kstrlen
 ```
@@ -112,6 +114,14 @@ one caused, or would have caused, a real bug.
 - **A new page table must be zeroed before it is installed.** `pmm_alloc_block`
   returns whatever bytes were there, and a stray Present bit maps a garbage
   frame.
+- **The heap's block list is address-ordered**, and coalescing depends on it:
+  `kfree` merges with `block->next` on the assumption that a neighbour in the
+  list is a neighbour in memory. `kmalloc`'s split preserves this by inserting
+  the remainder directly after the block it came from. Anything that reorders
+  the list silently turns coalescing into corruption.
+- **`sizeof` the heap header must stay a multiple of `KHEAP_ALIGNMENT`**, or
+  every payload drifts out of alignment as the chain grows. A `_Static_assert`
+  fails the build rather than letting that happen quietly.
 - **Every object depends on the Makefile itself**, so changing a compiler flag
   forces a full rebuild instead of leaving stale objects with mismatched ABI.
 
@@ -135,6 +145,10 @@ These are deliberate boundaries, not oversights:
 - **Spurious IRQ 7/15 are not detected** via the in-service register. Not
   reachable while those lines stay masked.
 - **Only IRQ1 is unmasked.** There is no timer driver yet.
+- **The heap is a fixed 1 MiB and never grows.** `kmalloc` returns `NULL` once
+  it is full; freed pages are not returned to the physical allocator.
+- **First fit is O(n) in the number of blocks**, and there is no free list, so a
+  heavily fragmented heap makes allocation slow before it makes it fail.
 
 ## License
 

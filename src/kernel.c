@@ -7,6 +7,7 @@
 #include "cpu/pic.h"
 #include "drivers/keyboard.h"
 #include "drivers/vga.h"
+#include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
 #include "multiboot.h"
@@ -149,11 +150,6 @@ static uint32_t memory_init(const struct multiboot_info *mbi)
             continue;
         }
 
-        if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
-            kprintf("Usable: 0x%x-0x%x (%u KiB)\n", base, base + length - 1u,
-                    length / 1024u);
-        }
-
         /* Only usable RAM sets the ceiling. Frames above the highest available
          * address can never be handed out, so covering them would just inflate
          * the bitmap -- QEMU reports the BIOS flash at 0xFFFC0000, which alone
@@ -223,19 +219,59 @@ static void paging_test(void)
 
     *via_virtual = 0xDEADBEEFu;
 
-    kprintf("\nTest : mapped virtual 0x%x -> physical 0x%x\n", virt, phys);
-    kprintf("       wrote 0xdeadbeef, read back 0x%x %s\n", *via_virtual,
-            (*via_virtual == 0xDEADBEEFu) ? "(match)" : "(MISMATCH)");
-
     /* Reading the same bytes back through the identity map proves the
      * translation actually landed on the intended frame. Writing and reading
-     * one virtual address alone would pass even if it mapped somewhere else
-     * entirely. */
+     * one virtual address alone would pass even if it mapped somewhere else. */
     const volatile uint32_t *const via_physical =
         (const volatile uint32_t *)(uintptr_t)phys;
 
-    kprintf("       via physical 0x%x: 0x%x %s\n", phys, *via_physical,
-            (*via_physical == 0xDEADBEEFu) ? "(same frame)" : "(DIFFERENT FRAME)");
+    kprintf("        mapped 0x%x -> 0x%x, readback via both %s\n", virt, phys,
+            (*via_virtual == 0xDEADBEEFu && *via_physical == 0xDEADBEEFu) ? "OK"
+                                                                         : "FAILED");
+}
+
+static void heap_test(void)
+{
+    kprintf("\nHeap : %u KiB at 0x%x; header %u B, payloads %u-byte aligned\n",
+            kheap_total_bytes() / 1024u, KHEAP_VIRTUAL_BASE,
+            (uint32_t)sizeof(struct kheap_block), KHEAP_ALIGNMENT);
+
+    void *const a = kmalloc(32);
+    void *const b = kmalloc(100);
+    void *const c = kmalloc(7);
+
+    if (a == NULL || b == NULL || c == NULL) {
+        kprintf("  allocation failed\n");
+        return;
+    }
+
+    /* ORing the three addresses puts every low bit that any of them set into
+     * one value, so a single mask tests all three at once. */
+    const bool aligned = (((uint32_t)(uintptr_t)a | (uint32_t)(uintptr_t)b |
+                           (uint32_t)(uintptr_t)c) &
+                          (KHEAP_ALIGNMENT - 1u)) == 0;
+
+    kprintf("  kmalloc 32/100/7 -> %p %p %p %s\n", a, b, c,
+            aligned ? "(8-byte aligned)" : "(MISALIGNED)");
+    kprintf("  blocks=%u used=%u B free=%u B\n", kheap_block_count(),
+            kheap_used_bytes(), kheap_free_bytes());
+
+    kfree(b);
+
+    void *const reused = kmalloc(64);
+
+    kprintf("  kfree(b) then kmalloc(64) -> %p %s\n", reused,
+            reused == b ? "(reused b's block)" : "(different block)");
+
+    const uint32_t before = kheap_block_count();
+
+    kfree(reused);
+    kfree(a);
+    kfree(c);
+
+    kprintf("  freed all: blocks %u -> %u, largest free %u B %s\n", before,
+            kheap_block_count(), kheap_largest_free_block(),
+            kheap_block_count() == 1 ? "(fully coalesced)" : "(FRAGMENTED)");
 }
 
 void kernel_main(uint32_t magic, uint32_t mb_info_addr)
@@ -268,10 +304,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
             paging_init();
 
             if (paging_is_enabled()) {
-                kprintf("\nPaging: directory at 0x%x, identity map 0x0-0x%x\n",
+                kprintf("\nPaging: dir 0x%x, identity 0x0-0x%x, CR0.PG+WP set\n",
                         paging_directory_physical(), paging_identity_limit());
-                kprintf("        CR0.PG+WP set, CR3 = 0x%x\n", paging_directory_physical());
                 paging_test();
+
+                if (kheap_init()) {
+                    heap_test();
+                } else {
+                    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                    kprintf("\nHeap failed to initialise.\n");
+                }
             } else {
                 vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
                 kprintf("\nPaging failed to initialise.\n");
