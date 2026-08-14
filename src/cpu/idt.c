@@ -5,6 +5,7 @@
 #include "cpu/idt.h"
 #include "cpu/irq.h"
 #include "cpu/isr.h"
+#include "sys/syscall.h"
 
 /* Intel SDM Vol. 3A, section 6.11. As with the GDT the handler address is split
  * either side of the selector and attribute bytes. */
@@ -26,6 +27,13 @@ struct idt_ptr {
  * entry, unlike a trap gate, so a handler cannot be interrupted by the very
  * condition it is servicing. */
 #define IDT_GATE_INTERRUPT_32 0x8E
+
+/* Same gate with DPL 3. The DPL of an interrupt gate is the highest CPL
+ * allowed to reach it with an int instruction, so without this a ring-3
+ * int 0x80 raises #GP instead of entering the kernel. It is deliberately the
+ * only such gate: every other vector stays DPL 0 so user code cannot fake a
+ * page fault or an IRQ. */
+#define IDT_GATE_INTERRUPT_32_USER 0xEE
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_ptr   idt_pointer;
@@ -77,6 +85,9 @@ void idt_init(void)
         idt_set_gate(IRQ_VECTOR_BASE + i, (uint32_t)(uintptr_t)irq_stubs[i],
                      GDT_KERNEL_CODE_SELECTOR, IDT_GATE_INTERRUPT_32);
     }
+
+    idt_set_gate(SYSCALL_VECTOR, (uint32_t)(uintptr_t)isr128, GDT_KERNEL_CODE_SELECTOR,
+                 IDT_GATE_INTERRUPT_32_USER);
 
     idt_pointer.limit = (uint16_t)(sizeof(idt) - 1);
     idt_pointer.base  = (uint32_t)(uintptr_t)&idt;

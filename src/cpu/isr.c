@@ -4,6 +4,7 @@
 #include "cpu/isr.h"
 #include "drivers/vga.h"
 #include "mm/paging.h"
+#include "sys/syscall.h"
 #include "utils/stdio.h"
 
 /* Intel SDM Vol. 3A, Table 6-1. */
@@ -44,12 +45,19 @@ static const char *const exception_names[ISR_EXCEPTION_COUNT] = {
 
 void interrupt_dispatch(struct registers *regs)
 {
-    /* Vectors 0-31 are the architecturally reserved CPU exceptions; everything
-     * from 32 up is a remapped PIC line. */
-    if (regs->int_no < IRQ_VECTOR_BASE) {
+    /* Vectors 0-31 are the architecturally reserved CPU exceptions, 32-47 are
+     * the remapped PIC lines, and 0x80 is the system call gate. The syscall
+     * check comes first because 0x80 is above the IRQ base and would otherwise
+     * be dispatched as a hardware line -- and acknowledged to a PIC that never
+     * raised it. */
+    if (regs->int_no == SYSCALL_VECTOR) {
+        syscall_handler(regs);
+    } else if (regs->int_no < IRQ_VECTOR_BASE) {
         isr_handler(regs);
-    } else {
+    } else if (regs->int_no < IRQ_VECTOR_BASE + IRQ_COUNT) {
         irq_handler(regs);
+    } else {
+        kprintf("\n[unexpected interrupt vector %u]\n", regs->int_no);
     }
 }
 
@@ -82,11 +90,27 @@ void isr_handler(struct registers *regs)
                 (regs->err_code & PAGE_FAULT_FETCH) ? ", instruction fetch" : "");
     }
 
+    /* A fault in ring 3 is the user program's problem, not the kernel's. Park
+     * that task with interrupts still ENABLED so the timer keeps firing and the
+     * scheduler moves on -- halting here would take the PIT, the run queue and
+     * every unrelated ring-0 task down with it, which is a user program being
+     * able to stop the whole machine.
+     *
+     * The task never runs again, but each visit here pushes and pops one
+     * interrupt frame, so its kernel stack use stays bounded. */
+    if (registers_from_user(regs)) {
+        kprintf("  user task parked; the kernel keeps running.\n");
+
+        for (;;) {
+            __asm__ volatile ("sti; hlt");
+        }
+    }
+
     kprintf("  halted.\n");
 
-    /* Nothing here can fix the fault, and returning would re-execute the
-     * faulting instruction forever. Mask interrupts and stop the CPU; the
-     * jump back into hlt catches an NMI waking us up. */
+    /* A ring-0 fault is different: there is no smaller unit to sacrifice and
+     * nothing left that can be trusted to keep running. Mask interrupts and
+     * stop; the jump back into hlt catches an NMI waking us up. */
     for (;;) {
         __asm__ volatile ("cli; hlt");
     }

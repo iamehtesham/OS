@@ -1,9 +1,15 @@
 #ifndef CPU_ISR_H
 #define CPU_ISR_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define ISR_EXCEPTION_COUNT 32
+
+/* Software interrupt vector reserved for system calls. Its IDT gate carries
+ * DPL 3 so ring 3 is allowed to raise it; every other gate stays DPL 0, which
+ * is what stops user code from forging an exception or an IRQ. */
+#define SYSCALL_VECTOR 0x80
 
 /* Vector 14. Unlike other exceptions it reports the offending address out of
  * band, in CR2 rather than in the interrupt frame. */
@@ -20,10 +26,11 @@
  * order mirrors the push order exactly, lowest address first, so a pointer to
  * the saved DS is a pointer to this struct.
  *
- * There is deliberately no useresp/ss pair at the end: the CPU only pushes
- * those when the interrupt crosses a privilege boundary, and this kernel never
- * leaves ring 0. Declaring them would invite reads of whatever happens to sit
- * above the frame. */
+ * useresp and ss exist ONLY when the interrupt crossed a privilege boundary --
+ * the CPU pushes the interrupted stack there so iret can switch back. For an
+ * interrupt taken in ring 0 the frame simply ends at eflags and those two
+ * fields alias whatever happens to sit above it. Test (cs & 3) != 0 before
+ * reading them. */
 struct registers {
     uint32_t ds;        /* pushed by the stub */
     uint32_t edi;       /* pusha, in the order it writes them */
@@ -39,7 +46,16 @@ struct registers {
     uint32_t eip;       /* pushed by the CPU */
     uint32_t cs;
     uint32_t eflags;
+    uint32_t useresp;   /* present only when (cs & 3) != 0 */
+    uint32_t ss;        /* likewise */
 } __attribute__((packed));
+
+/* True when the interrupt arrived from ring 3, which is also exactly when
+ * useresp and ss are meaningful. */
+static inline bool registers_from_user(const struct registers *regs)
+{
+    return (regs->cs & 3u) != 0u;
+}
 
 /* Called from interrupt_common_stub for every vector. Routes to the exception
  * handler or the IRQ dispatcher based on the vector number. */
