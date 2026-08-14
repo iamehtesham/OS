@@ -85,6 +85,15 @@ bool map_page(uint32_t physical_addr, uint32_t virtual_addr, uint32_t flags)
          * the PTE says. USER is propagated because it is likewise ANDed. */
         page_directory[dir_index] = (table_phys & PAGE_FRAME_MASK) | PAGE_PRESENT |
                                     PAGE_WRITABLE | (flags & PAGE_USER);
+    } else if ((flags & PAGE_USER) != 0) {
+        /* The table already exists, and it was almost certainly built for
+         * supervisor pages. Permissions are ANDed along the walk, so a user
+         * page underneath a supervisor-only directory entry is still
+         * unreachable from ring 3. Widen the entry.
+         *
+         * This does not open the other pages in the range: each PTE keeps its
+         * own user bit, and both levels must agree. */
+        page_directory[dir_index] |= PAGE_USER;
     }
 
     page_entry_t *const table =
@@ -126,8 +135,21 @@ void paging_init(void)
     for (;;) {
         const uint32_t required = pmm_highest_used_address();
 
-        if (required > identity_limit) {
-            identity_limit = align_up(required, PAGING_DIRECTORY_SPAN);
+        /* Reserve headroom rather than converging exactly on the high-water
+         * mark: map_page still has to allocate page tables after CR0.PG is
+         * set, and those come from the first free frame. Land the window flush
+         * against the mark and that frame is outside it, so every later
+         * mapping fails the reachability guard -- which is how a mid-sized
+         * Multiboot module can leave the kernel with no heap at all. */
+        if (required <= UINT32_MAX - PAGING_TABLE_RESERVE) {
+            const uint32_t wanted = align_up(required + PAGING_TABLE_RESERVE,
+                                             PAGING_DIRECTORY_SPAN);
+
+            /* align_up wraps to 0 within one span of the top of memory; only
+             * take the new value when it is genuinely an increase. */
+            if (wanted > identity_limit) {
+                identity_limit = wanted;
+            }
         }
 
         if (mapped >= identity_limit) {
@@ -143,6 +165,15 @@ void paging_init(void)
 
             mapped += PAGE_SIZE;
         }
+    }
+
+    /* The whole point of the loop is that allocation can still proceed once
+     * translation is on. Say so out loud rather than discovering it later as an
+     * unexplained map_page failure. */
+    if (pmm_highest_used_address() >= identity_limit) {
+        kprintf("paging: no reachable frames left below 0x%x\n", identity_limit);
+        page_directory = NULL;
+        return;
     }
 
     paging_enable(page_directory_phys);
@@ -162,6 +193,30 @@ uint32_t paging_identity_limit(void)
 bool paging_is_enabled(void)
 {
     return paging_enabled;
+}
+
+bool paging_user_can_read(uint32_t virtual_addr)
+{
+    if (page_directory == NULL) {
+        return false;
+    }
+
+    const uint32_t dir_index   = (virtual_addr >> PAGE_DIRECTORY_SHIFT) & PAGE_INDEX_MASK;
+    const uint32_t table_index = (virtual_addr >> PAGE_TABLE_SHIFT) & PAGE_INDEX_MASK;
+    const uint32_t pde         = page_directory[dir_index];
+
+    /* Both levels must be present AND user-accessible, because that is exactly
+     * the test the hardware applies. Checking only the PTE would report pages
+     * reachable that the MMU would in fact refuse. */
+    if ((pde & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER)) {
+        return false;
+    }
+
+    const page_entry_t *const table =
+        (const page_entry_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
+    const uint32_t pte = table[table_index];
+
+    return (pte & (PAGE_PRESENT | PAGE_USER)) == (PAGE_PRESENT | PAGE_USER);
 }
 
 uint32_t paging_fault_address(void)

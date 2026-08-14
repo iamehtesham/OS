@@ -38,6 +38,13 @@
  * a whole number of these, since each one costs exactly one page table. */
 #define PAGING_DIRECTORY_SPAN 0x400000u
 
+/* Frames kept free BELOW the identity window for the page tables map_page must
+ * still allocate after CR0.PG is set. Growing the window to exactly the
+ * allocator's high-water mark is not enough: the tables built while growing it
+ * raise that mark themselves, so the fixed point can settle with no reachable
+ * frame left and every later mapping failing the reachability guard. */
+#define PAGING_TABLE_RESERVE (16u * PAGE_SIZE) /* 64 KiB, i.e. 16 page tables */
+
 /* Builds the page directory, identity-maps the low 4 MiB and turns on the MMU. */
 void paging_init(void);
 
@@ -46,6 +53,12 @@ void paging_init(void);
  * if a new table would land outside the reachable identity-mapped window.
  * flags are the PTE bits below PAGE_FRAME_MASK; PAGE_PRESENT is always set. */
 bool map_page(uint32_t physical_addr, uint32_t virtual_addr, uint32_t flags);
+
+/* True when ring 3 could read the given address: both the directory entry and
+ * the page table entry must be present and user-accessible, which is the same
+ * test the MMU applies. Used to vet pointers handed in by system calls rather
+ * than dereferencing them on trust. */
+bool paging_user_can_read(uint32_t virtual_addr);
 
 uint32_t paging_directory_physical(void);
 uint32_t paging_identity_limit(void);
