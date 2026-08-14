@@ -48,6 +48,10 @@ directly — no GRUB, no ISO, no disk image is involved.
 | **Physical memory** | Bitmap allocator over 4 KiB frames, driven by the Multiboot memory map |
 | **Paging** | Two-level page tables, identity-mapped low memory, `CR0.PG` + `CR0.WP` |
 | **Kernel heap** | `kmalloc`/`kfree` over a 1 MiB region at `0xC0000000`: linked list of blocks, first fit, splitting, and coalescing in both directions |
+| **VFS** | `fs_node` with a function-pointer table (`read`/`write`/`open`/`close`/`readdir`/`finddir`) and wrappers that dispatch only when a driver implements the slot |
+| **Initrd** | Read-only driver for a flat image packed by `tools/make_initrd.py` and delivered as a Multiboot module |
+| **Multitasking** | Preemptive round robin on a 100 Hz PIT, with an assembly context switch and forged first-run frames |
+| **Ring 3** | User-mode segments, a TSS supplying `ss0:esp0`, and a `sys_print` system call through an `int 0x80` gate at DPL 3 |
 
 ## Layout
 
@@ -69,6 +73,10 @@ src/mm/pmm.c            physical frame allocator
 src/mm/paging.c         page directory, page tables, map_page
 src/mm/paging_enable.S  loads CR3, sets CR0.PG and CR0.WP
 src/mm/kheap.c          kmalloc / kfree over a linked list of blocks
+src/fs/vfs.c            fs_node dispatch through a function-pointer table
+src/fs/initrd.c         read-only driver for the packed initrd image
+tools/make_initrd.py    host-side packer; writes the format initrd.h declares
+initrd/                 files packed into the image, one per entry
 src/utils/stdio.c       kprintf
 src/utils/string.c      kstrlen
 ```
@@ -149,6 +157,15 @@ These are deliberate boundaries, not oversights:
   it is full; freed pages are not returned to the physical allocator.
 - **First fit is O(n) in the number of blocks**, and there is no free list, so a
   heavily fragmented heap makes allocation slow before it makes it fail.
+- **The initrd is flat and read-only.** No subdirectories, no path parsing, no
+  writing, no creation or deletion. `readdir` returns a pointer to a single
+  shared `dirent`, which is safe only while the kernel is single-threaded.
+- **Only one filesystem can be mounted**, at `/`. There is no mount table.
+- **One user program, sharing the kernel's address space.** Ring 3 gets page-level
+  protection but no separate page directory, no ELF loader, and no fork/exec.
+- **The user code and message pages are shared with neighbouring kernel `.text`
+  and `.rodata`**, so ring 3 can read a few KiB of kernel image. Linking user
+  code into its own section is the fix.
 
 ## License
 
