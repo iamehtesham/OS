@@ -4,7 +4,7 @@ build/
 
 # Local working notes, kept out of the published repo. The design invariants it
 # recorded now live in README.md.
-claude.md
+NOTES.md
 
 # Editor and OS noise
 *.swp
