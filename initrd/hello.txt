@@ -1,0 +1,2 @@
+Hello from a file on the initrd!
+This text lives in initrd.img and was read back through the VFS.
