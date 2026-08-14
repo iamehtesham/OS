@@ -1,8 +1,10 @@
 #include <stdint.h>
 
 #include "cpu/gdt.h"
+#include "cpu/tss.h"
 
-#define GDT_ENTRIES 3
+/* null, kernel code, kernel data, user code, user data, TSS */
+#define GDT_ENTRIES 6
 
 /* Intel SDM Vol. 3A, section 3.4.5. The base and limit are scattered across
  * non-contiguous fields because the layout still carries the 286's segment
@@ -27,6 +29,20 @@ struct gdt_ptr {
  *   0x92 = present, ring 0, code/data, read-and-write data segment */
 #define GDT_ACCESS_KERNEL_CODE 0x9A
 #define GDT_ACCESS_KERNEL_DATA 0x92
+
+/* Same segment types, DPL 3 instead of 0. The DPL is what the CPU compares
+ * against CPL, so this is the bit that actually grants ring-3 access. */
+#define GDT_ACCESS_USER_CODE 0xFA
+#define GDT_ACCESS_USER_DATA 0xF2
+
+/* Present, DPL 0, system descriptor (S=0), type 1001 = available 32-bit TSS.
+ * DPL 0 is correct: the descriptor is consulted by the CPU on a privilege
+ * change, never loaded by ring 3. */
+#define GDT_ACCESS_TSS 0x89
+
+/* A TSS descriptor measures its limit in bytes, so G and D/B are both clear
+ * and the flags nibble is zero. */
+#define GDT_GRANULARITY_TSS 0x00
 
 /* Granularity byte: G=1 scales the limit by 4 KiB, D/B=1 selects 32-bit
  * operands and addresses, and the low nibble carries limit bits 16-19. 0xCF is
@@ -61,6 +77,16 @@ void gdt_init(void)
     gdt_set_gate(0, 0, 0, 0, 0);
     gdt_set_gate(1, 0, 0xFFFFF, GDT_ACCESS_KERNEL_CODE, GDT_GRANULARITY_4K_32BIT);
     gdt_set_gate(2, 0, 0xFFFFF, GDT_ACCESS_KERNEL_DATA, GDT_GRANULARITY_4K_32BIT);
+
+    /* Ring 3 spans the same flat 4 GiB. Segmentation is not what isolates user
+     * code here -- paging is, via the per-page user bit. These exist so ring 3
+     * has selectors it is allowed to load at all. */
+    gdt_set_gate(3, 0, 0xFFFFF, GDT_ACCESS_USER_CODE, GDT_GRANULARITY_4K_32BIT);
+    gdt_set_gate(4, 0, 0xFFFFF, GDT_ACCESS_USER_DATA, GDT_GRANULARITY_4K_32BIT);
+
+    /* The TSS descriptor describes a single structure, not an address space,
+     * so its base and limit come from the object itself. */
+    gdt_set_gate(5, tss_base(), tss_limit(), GDT_ACCESS_TSS, GDT_GRANULARITY_TSS);
 
     /* The limit field holds the size in bytes minus one. */
     gdt_pointer.limit = (uint16_t)(sizeof(gdt) - 1);
