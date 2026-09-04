@@ -14,15 +14,12 @@
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
-#include "sys/syscall.h"
 #include "task/scheduler.h"
 #include "task/task.h"
+#include "user/ipc_demo.h"
 #include "multiboot.h"
 #include "utils/stdio.h"
 #include "utils/string.h"
-
-/* Defined in src/task/user.S. */
-extern void switch_to_user_mode(uint32_t entry, uint32_t user_stack_top);
 
 /* Emitted by linker.ld to bracket the loaded image, .bss included. Declared as
  * arrays so the symbol's address is the value, without a spurious load. */
@@ -356,130 +353,6 @@ static void vfs_test(const struct multiboot_info *mbi)
  * CPU lands when ring 3 traps into the kernel. */
 extern uint8_t stack_top[];
 
-/* Burns roughly a timeslice so the alternating pattern is legible instead of
- * scrolling past faster than it can be read. volatile stops GCC deleting a
- * loop with no effect. */
-static void task_delay(void)
-{
-    for (volatile uint32_t i = 0; i < 3000000u; i++) {
-    }
-}
-
-/* Both tasks share the VGA driver with no locking, so a preemption partway
- * through kprintf can interleave two writes. With one character per call the
- * window is a few instructions wide and the worst case is a transposed
- * character -- worth knowing, and the reason a real kernel needs a lock here. */
-static void task_a(void)
-{
-    for (;;) {
-        kprintf("A");
-        task_delay();
-    }
-}
-
-static void task_b(void)
-{
-    for (;;) {
-        kprintf("B");
-        task_delay();
-    }
-}
-
-/* ---- ring 3 ---------------------------------------------------------- */
-
-/* Lives in the kernel image's .rodata, so the page holding it has to be made
- * user-readable before ring 3 can pass it to the kernel. */
-static const char user_message[] = "  [ring 3] hello via int 0x80\n";
-
-/* Runs at CPL 3. It may not execute cli, sti, hlt, in, out, or touch any
- * control register -- every one of those faults at this privilege level. The
- * only way it can reach the kernel at all is the int 0x80 gate. */
-static void user_test(void)
-{
-    for (;;) {
-        uint32_t written;
-
-        /* EAX carries the call number and comes back holding the result; EBX
-         * carries the argument. The memory clobber stops GCC caching anything
-         * across a call that prints. */
-        __asm__ volatile ("int $0x80"
-                          : "=a"(written)
-                          : "a"(SYS_PRINT), "b"(user_message)
-                          : "memory");
-
-        (void)written;
-
-        /* A busy loop is the only way ring 3 can pace itself: hlt is
-         * privileged. The timer still preempts this, which is what proves the
-         * scheduler survives the privilege drop. */
-        for (volatile uint32_t i = 0; i < 12000000u; i++) {
-        }
-    }
-}
-
-/* Identity-maps a range as user-accessible. map_page also widens the directory
- * entry, which matters because these pages sit under the kernel's existing
- * supervisor-only table and permissions are ANDed along the walk. */
-static bool map_user_range(uint32_t start, uint32_t length, uint32_t flags)
-{
-    const uint32_t first = start & PAGE_FRAME_MASK;
-    const uint32_t last  = (start + length - 1u) & PAGE_FRAME_MASK;
-
-    for (uint32_t page = first; page <= last; page += PAGE_SIZE) {
-        /* map_page really can fail -- it needs a frame for a new page table,
-         * and refuses one it could not reach after CR0.PG. Dropping to ring 3
-         * with an unmapped stack would fault on the first push. */
-        if (!map_page(page, page, PAGE_USER | flags)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static void enter_user_mode(void)
-{
-    void *const stack_frame = pmm_alloc_block();
-
-    if (stack_frame == NULL) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nNo frame for a user stack.\n");
-        return;
-    }
-
-    const uint32_t user_stack = (uint32_t)(uintptr_t)stack_frame;
-
-    /* Ring 3 needs exactly three things reachable: the code it runs, the
-     * string it hands to the kernel, and a stack. Everything else stays
-     * supervisor-only, so a stray user pointer is refused by the MMU rather
-     * than quietly honoured.
-     *
-     * The code and string pages are mapped without PAGE_WRITABLE, so ring 3
-     * can read and execute but not modify them. They do share their pages with
-     * neighbouring kernel code and rodata, which ring 3 can therefore read --
-     * a real information leak, and the reason a grown-up kernel links user
-     * code into its own section. */
-    const bool mapped =
-        map_user_range((uint32_t)(uintptr_t)user_test, PAGE_SIZE, 0) &&
-        map_user_range((uint32_t)(uintptr_t)user_message, sizeof(user_message), 0) &&
-        map_user_range(user_stack, PAGE_SIZE, PAGE_WRITABLE);
-
-    if (!mapped) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nCould not map the ring-3 pages; staying in ring 0.\n");
-        pmm_free_block(stack_frame);
-        return;
-    }
-
-    kprintf("User  : entry %p, stack %p, gate int 0x%x (DPL 3)\n",
-            (void *)(uintptr_t)user_test, (void *)(uintptr_t)(user_stack + PAGE_SIZE),
-            SYSCALL_VECTOR);
-
-    /* Does not return: the only way down to ring 3 is an iret, and there is no
-     * instruction that comes back up except a trap. */
-    switch_to_user_mode((uint32_t)(uintptr_t)user_test, user_stack + PAGE_SIZE);
-}
-
 static void tasking_start(void)
 {
     if (!tasking_init()) {
@@ -493,14 +366,19 @@ static void tasking_start(void)
     pit_init(100);
     scheduler_init();
 
-    if (create_task(task_a) == NULL || create_task(task_b) == NULL) {
+    /* The receiver is created first so it gets IPC_DEMO_RECEIVER_PID, which is
+     * the pid the sender addresses. */
+    task_t *const receiver = create_user_task(ipc_demo_receiver);
+    task_t *const sender   = create_user_task(ipc_demo_sender);
+
+    if (receiver == NULL || sender == NULL) {
         vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nCould not create tasks.\n");
+        kprintf("\nCould not create the user tasks.\n");
         return;
     }
 
-    kprintf("Tasks : PIT at %u Hz, %u tasks (kernel + A + B), round robin\n",
-            pit_frequency(), task_count());
+    kprintf("Tasks : PIT %u Hz; ring-3 receiver pid %u, sender pid %u; kernel idles\n",
+            pit_frequency(), receiver->pid, sender->pid);
 }
 
 void kernel_main(uint32_t magic, uint32_t mb_info_addr)
@@ -564,15 +442,14 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     __asm__ volatile ("sti");
 
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-    kprintf("\nInterrupts on. A and B run in ring 0, the message below in ring 3:\n\n");
+    kprintf("\nInterrupts on. Two ring-3 tasks pass messages through int 0x80:\n\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
-    /* Drops this thread to ring 3 and never comes back. The tasks created above
-     * keep running in ring 0, preempting it, which is the point: the privilege
-     * drop does not stop the scheduler. */
-    enter_user_mode();
-
-    /* Only reached if entering ring 3 failed. */
+    /* The kernel thread is the idle task. It never blocks and never dies, so
+     * the scheduler always has somewhere to go when every other task is
+     * waiting on a message -- which is what makes blocking in recv safe. The
+     * scheduler only picks it when nothing else is runnable, so hlt here means
+     * the whole machine genuinely has nothing to do until the next interrupt. */
     for (;;) {
         __asm__ volatile ("hlt");
     }

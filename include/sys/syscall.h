@@ -5,8 +5,12 @@
 
 #include "cpu/isr.h"
 
-/* Call numbers, passed in EAX. */
-#define SYS_PRINT 1u
+/* Call numbers, passed in EAX. Arguments go in EBX then ECX; the result comes
+ * back in EAX. */
+#define SYS_PRINT 1u /* ebx = const char *              -> chars written    */
+#define SYS_SEND  2u /* ebx = target pid, ecx = msg *   -> IPC_OK or error  */
+#define SYS_RECV  3u /* ebx = msg *; blocks until one arrives               */
+#define SYS_YIELD 4u /* give up the rest of this timeslice                  */
 
 /* Longest string sys_print will copy out of user memory. A user pointer is not
  * trusted to be terminated, so the length has to be bounded by something. */

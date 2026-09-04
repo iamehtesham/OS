@@ -2,8 +2,10 @@
 #include <stdint.h>
 
 #include "cpu/isr.h"
+#include "ipc/ipc.h"
 #include "mm/paging.h"
 #include "sys/syscall.h"
+#include "task/scheduler.h"
 #include "utils/stdio.h"
 
 static uint32_t call_count;
@@ -62,6 +64,23 @@ void syscall_handler(struct registers *regs)
         /* Result goes back in eax: popa restores the frame on the way out, so
          * writing the field here is what the caller sees in its own EAX. */
         regs->eax = sys_print(regs->ebx);
+        break;
+
+    case SYS_SEND:
+        regs->eax = (uint32_t)ipc_send(regs->ebx, regs->ecx);
+        break;
+
+    case SYS_RECV:
+        /* May not return for a long time: if nothing is waiting, the task
+         * blocks and the scheduler switches away from inside this call. This
+         * frame stays parked on the task's kernel stack until a sender wakes
+         * it, at which point execution resumes here and unwinds to iret. */
+        regs->eax = (uint32_t)ipc_recv(regs->ebx);
+        break;
+
+    case SYS_YIELD:
+        schedule();
+        regs->eax = 0;
         break;
 
     default:

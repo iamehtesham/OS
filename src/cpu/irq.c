@@ -40,16 +40,26 @@ void irq_handler(struct registers *regs)
 {
     const uint32_t irq = regs->int_no - IRQ_VECTOR_BASE;
 
-    if (irq < IRQ_COUNT && irq_handlers[irq] != NULL) {
-        irq_handlers[irq](regs);
+    if (irq >= IRQ_COUNT) {
+        return;
     }
 
-    /* The EOI is sent here rather than inside each callback for two reasons:
-     * an unhandled line still has to be acknowledged or the PIC never delivers
-     * it again, and no individual handler can forget to do it. Sending it after
-     * the callback keeps the line's in-service bit set for the duration, so the
-     * same device cannot stack a second interrupt on top of the first. */
-    if (irq < IRQ_COUNT) {
-        pic_send_eoi((uint8_t)irq);
+    /* Acknowledge BEFORE dispatching, and centrally rather than in each
+     * callback, so an unhandled line is still acknowledged and no handler can
+     * forget to.
+     *
+     * Before is the important word. A callback can switch stacks and never
+     * return -- the scheduler does exactly that -- and a task can also park
+     * itself from a system call, whose frame has no EOI in it at all. Sending
+     * the EOI after the callback would make each tick's acknowledgement depend
+     * on whichever task happens to resume next unwinding the right kind of
+     * frame. Sending it first means every tick acknowledges itself and no such
+     * bookkeeping exists. Re-entry is not a concern: the gate cleared IF, so no
+     * interrupt can be delivered until the iret regardless of when the PIC was
+     * told. */
+    pic_send_eoi((uint8_t)irq);
+
+    if (irq_handlers[irq] != NULL) {
+        irq_handlers[irq](regs);
     }
 }

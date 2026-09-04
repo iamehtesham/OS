@@ -5,6 +5,8 @@
 #include "drivers/vga.h"
 #include "mm/paging.h"
 #include "sys/syscall.h"
+#include "task/scheduler.h"
+#include "task/task.h"
 #include "utils/stdio.h"
 
 /* Intel SDM Vol. 3A, Table 6-1. */
@@ -90,16 +92,25 @@ void isr_handler(struct registers *regs)
                 (regs->err_code & PAGE_FAULT_FETCH) ? ", instruction fetch" : "");
     }
 
-    /* A fault in ring 3 is the user program's problem, not the kernel's. Park
-     * that task with interrupts still ENABLED so the timer keeps firing and the
-     * scheduler moves on -- halting here would take the PIT, the run queue and
-     * every unrelated ring-0 task down with it, which is a user program being
-     * able to stop the whole machine.
+    /* A fault in ring 3 is the user program's problem, not the kernel's. Mark
+     * the task dead and switch away -- halting here would take the PIT, the run
+     * queue and every unrelated task down with it, which is a user program
+     * being able to stop the whole machine.
      *
-     * The task never runs again, but each visit here pushes and pops one
-     * interrupt frame, so its kernel stack use stays bounded. */
+     * Dead, not merely parked: the scheduler skips TASK_DEAD, so no more slices
+     * are spent on the corpse, and ipc_send refuses it, so a sender learns the
+     * receiver is gone instead of getting IPC_OK for a message that lands in a
+     * mailbox nobody will ever read. This frame stays on the task's own kernel
+     * stack, which is never resumed. schedule() always has the idle task to go
+     * to; the loop below is only a safety net if it ever returns. */
     if (registers_from_user(regs)) {
-        kprintf("  user task parked; the kernel keeps running.\n");
+        task_t *const self = task_current();
+
+        if (self != NULL) {
+            self->state = TASK_DEAD;
+            kprintf("  user task pid %u marked dead; the kernel keeps running.\n", self->pid);
+            schedule();
+        }
 
         for (;;) {
             __asm__ volatile ("sti; hlt");

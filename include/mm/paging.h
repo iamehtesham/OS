@@ -60,6 +60,10 @@ bool map_page(uint32_t physical_addr, uint32_t virtual_addr, uint32_t flags);
  * than dereferencing them on trust. */
 bool paging_user_can_read(uint32_t virtual_addr);
 
+/* As above, but the page must also be writable. A receiver could otherwise
+ * point the kernel at its own read-only code page as a destination. */
+bool paging_user_can_write(uint32_t virtual_addr);
+
 uint32_t paging_directory_physical(void);
 uint32_t paging_identity_limit(void);
 bool     paging_is_enabled(void);

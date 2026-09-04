@@ -45,26 +45,40 @@ switch_task:
 .size switch_task, . - switch_task
 
 
-/* Entry point for a task being scheduled for the very first time.
+/* Entry point for a ring-0 task being scheduled for the very first time.
  *
- * switch_task's `ret` arrives here still inside the timer interrupt: IF is
- * clear because the gate cleared it, and the PIC has not been acknowledged
- * because irq_handler only does that after its callback returns -- and that
- * callback never returned, it switched stacks. Left alone, the task would run
- * forever with interrupts disabled and the timer line still in service.
- *
- * So: acknowledge the PIC, then iret off the frame create_task forged. The iret
- * restores EIP, CS and EFLAGS together, and it is the EFLAGS that turns
- * interrupts back on -- atomically, in the same instruction that enters the
- * task. */
+ * switch_task's `ret` arrives here still inside the timer interrupt, with IF
+ * clear because the gate cleared it. The PIC has already been acknowledged --
+ * irq_handler does that before dispatching -- so all that remains is to iret
+ * off the frame create_task forged. The iret restores EIP, CS and EFLAGS
+ * together, and it is the EFLAGS that turns interrupts back on, atomically, in
+ * the same instruction that enters the task. */
 .global task_bootstrap
 .type task_bootstrap, @function
 task_bootstrap:
-    pushl $0              /* IRQ 0 */
-    call pic_send_eoi
-    addl $4, %esp         /* balanced, so the iret frame is where we left it */
     iret
 
 .size task_bootstrap, . - task_bootstrap
+
+
+/* Same, for a task whose forged frame lands in ring 3.
+ *
+ * iret restores CS and SS but not the data segment registers, and on a return
+ * to a less privileged level the CPU nulls any of those still holding a
+ * descriptor ring 3 may not use. They have to be loaded with the user selector
+ * here, while still at CPL 0. The frame beneath is five words -- eip, cs,
+ * eflags, esp, ss -- and the RPL 3 in its CS is what tells iret to pop all
+ * five. */
+.global task_bootstrap_user
+.type task_bootstrap_user, @function
+task_bootstrap_user:
+    movw $0x23, %ax       /* GDT_USER_DATA_SELECTOR_RPL3 */
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    iret
+
+.size task_bootstrap_user, . - task_bootstrap_user
 
 .section .note.GNU-stack, "", @progbits

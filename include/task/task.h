@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ipc/ipc.h"
+
 /* Per-task kernel stack. Every task's interrupt frames, its parked
  * irq_handler frame and its C call chain all live here. */
 #define TASK_STACK_SIZE 8192u
@@ -13,8 +15,15 @@
  * entered from inside the timer handler. */
 #define TASK_INITIAL_EFLAGS 0x202u
 
+typedef enum {
+    TASK_RUNNING, /* eligible to be scheduled */
+    TASK_BLOCKED, /* waiting in ipc_recv for a message; skipped by the scheduler */
+    TASK_DEAD,    /* returned from its entry point; never scheduled again */
+} task_state_t;
+
 typedef struct task {
-    uint32_t id;
+    uint32_t     pid;
+    task_state_t state;
 
     /* Saved stack pointer. Everything else -- the general-purpose registers,
      * the return address, the interrupt frame -- lives ON that stack, which is
@@ -36,6 +45,18 @@ typedef struct task {
      * make two user tasks share one kernel stack. */
     uint32_t kernel_stack_top;
 
+    /* Single-slot mailbox. This lives in the TCB -- kernel memory on a
+     * supervisor page -- so the only path in or out is a system call, and a
+     * message is staged here between the sender's copy-in and the receiver's
+     * copy-out rather than ever moving user-to-user in one motion. */
+    ipc_message_t mailbox;
+    bool          mailbox_full;
+
+    /* False for the kernel idle task, which never calls recv. Without this a
+     * send to pid 0 would be accepted, report success, and leave the message
+     * parked in the kernel task's mailbox forever. */
+    bool can_receive;
+
     struct task *next; /* circular, so round-robin is just ->next */
 } task_t;
 
@@ -47,7 +68,18 @@ bool tasking_init(void);
  * and appends the task to the run list. Returns null if memory ran out. */
 task_t *create_task(void (*entry_point)(void));
 
+/* Like create_task, but the forged frame drops into ring 3: the entry runs
+ * with the user code selector on a freshly mapped user stack. The entry must
+ * live in the .utext section so its page can be made user-accessible. */
+task_t *create_user_task(void (*entry_point)(void));
+
 task_t  *task_current(void);
+task_t  *task_find(uint32_t pid);
+
+/* The kernel thread from tasking_init. It never blocks and never dies, which
+ * is what lets the scheduler treat it as the fallback when every other task
+ * is waiting -- and only then: it is not a round-robin peer. */
+task_t  *task_idle(void);
 uint32_t task_count(void);
 
 /* Switches to `next`, saving the outgoing task's state on its own stack. The
@@ -64,5 +96,6 @@ void switch_task(uint32_t *save_esp, uint32_t new_esp, uint32_t new_cr3);
  * task_bootstrap, which is where a brand-new task's forged frame begins. */
 void task_exit(void);
 void task_bootstrap(void);
+void task_bootstrap_user(void);
 
 #endif /* TASK_TASK_H */

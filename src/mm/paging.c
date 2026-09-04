@@ -195,7 +195,10 @@ bool paging_is_enabled(void)
     return paging_enabled;
 }
 
-bool paging_user_can_read(uint32_t virtual_addr)
+/* Both levels must carry every required bit, because that is exactly the test
+ * the hardware applies: permissions are ANDed along the walk, and checking only
+ * the PTE would report pages reachable that the MMU would in fact refuse. */
+static bool user_page_has(uint32_t virtual_addr, uint32_t required)
 {
     if (page_directory == NULL) {
         return false;
@@ -205,18 +208,24 @@ bool paging_user_can_read(uint32_t virtual_addr)
     const uint32_t table_index = (virtual_addr >> PAGE_TABLE_SHIFT) & PAGE_INDEX_MASK;
     const uint32_t pde         = page_directory[dir_index];
 
-    /* Both levels must be present AND user-accessible, because that is exactly
-     * the test the hardware applies. Checking only the PTE would report pages
-     * reachable that the MMU would in fact refuse. */
-    if ((pde & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER)) {
+    if ((pde & required) != required) {
         return false;
     }
 
     const page_entry_t *const table =
         (const page_entry_t *)(uintptr_t)(pde & PAGE_FRAME_MASK);
-    const uint32_t pte = table[table_index];
 
-    return (pte & (PAGE_PRESENT | PAGE_USER)) == (PAGE_PRESENT | PAGE_USER);
+    return (table[table_index] & required) == required;
+}
+
+bool paging_user_can_read(uint32_t virtual_addr)
+{
+    return user_page_has(virtual_addr, PAGE_PRESENT | PAGE_USER);
+}
+
+bool paging_user_can_write(uint32_t virtual_addr)
+{
+    return user_page_has(virtual_addr, PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE);
 }
 
 uint32_t paging_fault_address(void)

@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <stdint.h>
 
 #include "utils/string.h"
 
@@ -27,6 +28,18 @@ void kstrncpy(char *dest, const char *src, size_t size)
     }
 
     dest[i] = '\0';
+}
+
+void *kmemcpy(void *dest, const void *src, size_t n)
+{
+    uint8_t *const       d = (uint8_t *)dest;
+    const uint8_t *const s = (const uint8_t *)src;
+
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+
+    return dest;
 }
 
 int kstrcmp(const char *a, const char *b)
