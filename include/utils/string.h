@@ -20,4 +20,9 @@ int kstrcmp(const char *a, const char *b);
  * resolve. */
 void *kmemcpy(void *dest, const void *src, size_t n);
 
+/* Fills n bytes with value. Same reasoning as kmemcpy: written out explicitly
+ * so no zero-initialisation can turn into a call to a memset the freestanding
+ * link has no definition for. */
+void *kmemset(void *dest, int value, size_t n);
+
 #endif /* UTILS_STRING_H */

@@ -6,6 +6,8 @@ hardware interrupts, manages physical memory with a bitmap allocator and virtual
 memory with two-level paging, has a kernel heap and a read-only initrd behind a
 VFS, preempts tasks round-robin on the PIT, runs user programs in ring 3, and
 lets them talk to each other through a synchronous message-passing system call.
+It also loads ELF executables out of the initrd and runs each one as a process
+in a page directory of its own.
 
 Everything here is freestanding — no libc, no libgcc, no runtime.
 
@@ -48,13 +50,14 @@ directly — no GRUB, no ISO, no disk image is involved.
 | **PIC** | Both 8259s remapped off vectors 8–15, per-line masking, central EOI sent before dispatch |
 | **Keyboard** | PS/2 IRQ1, scancode set 1 → ASCII, make codes only |
 | **Physical memory** | Bitmap allocator over 4 KiB frames, driven by the Multiboot memory map |
-| **Paging** | Two-level page tables, identity-mapped low memory, `CR0.PG` + `CR0.WP` |
+| **Paging** | Two-level page tables, identity-mapped low memory, `CR0.PG` + `CR0.WP`, and per-process address spaces that share the kernel's tables without sharing its user bit |
 | **Kernel heap** | `kmalloc`/`kfree` over a 1 MiB region at `0xC0000000`: linked list of blocks, first fit, splitting, and coalescing in both directions |
 | **VFS** | `fs_node` with a function-pointer table (`read`/`write`/`open`/`close`/`readdir`/`finddir`) and wrappers that dispatch only when a driver implements the slot |
 | **Initrd** | Read-only driver for a flat image packed by `tools/make_initrd.py` and delivered as a Multiboot module |
 | **Multitasking** | Preemptive round robin on a 100 Hz PIT, with an assembly context switch and forged first-run frames; the kernel thread is the idle task and runs only when nothing else can |
 | **Ring 3** | User-mode segments, a TSS supplying `ss0:esp0`, and system calls through an `int 0x80` gate at DPL 3; a fault in ring 3 kills only that task |
 | **IPC** | Synchronous message passing between ring-3 tasks: single-slot mailboxes in the TCB, a blocking `recv` that parks the task, and a scheduler that skips blocked tasks |
+| **ELF loader** | Reads an `ET_EXEC` i386 binary from the initrd through the VFS, maps each `PT_LOAD` segment into a fresh address space with `.bss` allocated and zero-filled, and spawns it as a ring-3 process |
 
 ## Layout
 
@@ -75,12 +78,13 @@ src/drivers/vga.c       text console
 src/drivers/keyboard.c  PS/2 keyboard
 src/drivers/pit.c       programmable interval timer, 100 Hz tick hook
 src/mm/pmm.c            physical frame allocator
-src/mm/paging.c         page directory, page tables, map_page, user-page checks
+src/mm/paging.c         page directory, page tables, map_page, address spaces
 src/mm/paging_enable.S  loads CR3, sets CR0.PG and CR0.WP
 src/mm/kheap.c          kmalloc / kfree over a linked list of blocks
 src/fs/vfs.c            fs_node dispatch through a function-pointer table
 src/fs/initrd.c         read-only driver for the packed initrd image
-src/task/task.c         task control blocks; ring-0 and ring-3 task creation
+src/task/task.c         task control blocks; ring-0, ring-3 and process creation
+src/task/elf.c          ELF32 loader: validates a file, maps its PT_LOAD segments
 src/task/switch.S       context switch and the two first-run bootstraps
 src/task/scheduler.c    round robin over runnable tasks; schedule()
 src/task/user.S         switch_to_user_mode (unused now that tasks start in ring 3)
@@ -88,11 +92,21 @@ src/sys/syscall.c       int 0x80 dispatcher: sys_print, sys_send, sys_recv, sys_
 src/sys/uaccess.c       copy_from_user / copy_to_user with per-page validation
 src/ipc/ipc.c           ipc_send / ipc_recv over per-task mailboxes
 src/user/ipc_demo.c     two ring-3 programs, linked into their own .utext/.urodata
+src/user/programs/      standalone ring-3 binaries, linked by user.ld, NOT part
+                        of the kernel image; packed into the initrd and loaded
+                        at run time by the ELF loader
 tools/make_initrd.py    host-side packer; writes the format initrd.h declares
 initrd/                 files packed into the image, one per entry
+linker.ld               link map for the kernel image, loaded at 1 MiB
+user.ld                 link map for standalone ring-3 binaries, at 0x40000000
 src/utils/stdio.c       kprintf
-src/utils/string.c      kstrlen, kstrncpy, kstrcmp, kmemcpy
+src/utils/string.c      kstrlen, kstrncpy, kstrcmp, kmemcpy, kmemset
 ```
+
+`include/format/elf.h` carries the ELF32 file and program header structs, and
+`include/sys/syscall_abi.h` the system call numbers. That second one exists
+because standalone ring-3 binaries include it too, so it must stay free of
+kernel declarations.
 
 Headers mirror the source tree under `include/` and are included by subsystem
 path (`#include "drivers/vga.h"`). The Makefile discovers sources recursively, so
@@ -151,6 +165,55 @@ one caused, or would have caused, a real bug.
   mailbox into the receiver's own buffer when it wakes. Each half validates
   exactly one task's memory, and the kernel overwrites `sender_pid` rather than
   trusting it.
+- **`p_memsz` sizes the memory, `p_filesz` sizes the copy.** The difference is
+  `.bss`: bytes that must exist and read as zero but occupy nothing in the
+  file. Allocating frames from `p_filesz` gives a program that faults on its
+  first zero-initialised global. The loader zeroes each frame in full and then
+  copies only `p_filesz` bytes over it, which makes the `[p_filesz, p_memsz)`
+  gap, the slack past the end of the last page, and the leftover bytes of a
+  recycled frame all handled by the same act.
+- **An address space may only write page tables it owns.** Kernel tables are
+  shared into every address space rather than copied, so a mapping written into
+  one of them does not shadow the kernel's entry, it overwrites it, everywhere
+  at once. The check that enforces this lives in `map_into` and compares the
+  table's frame against the kernel directory's, because ownership is the real
+  question. An address-range check is the wrong shape and was the original bug
+  here: it silently assumed the kernel maps nothing inside the process window,
+  and the paging self-test did exactly that. A segment aimed there was written
+  into the kernel's own table, which handed the process a kernel frame, handed
+  two processes the same frames as each other, and leaked a frame when the
+  load was later refused.
+- **A kernel mapping inside the process window costs that whole 4 MiB span.**
+  Its table is shared into every address space, so nothing can be mapped there
+  for a process afterwards. The self-test address is asserted at compile time
+  to sit outside the window.
+- **Validating a page means testing both levels, always.** A page table entry
+  can say user-accessible while the directory entry reaching it does not, which
+  is exactly the state a shared kernel table is left in. Reading the page table
+  entry alone accepted entry points the MMU then refused, so the process was
+  built, given a pid and stacks, and died on its first instruction fetch.
+- **Kernel directory entries are shared with the user bit cleared.** A CPL 0
+  access ignores that bit, so the kernel loses nothing, while a process loses
+  the ability to reach any ring-3 page that lives in identity-mapped low
+  memory. Without it, a loaded process could read the code and stacks of the
+  ring-3 tasks linked into the kernel image, since they sit in tables every
+  address space shares.
+- **User pointers are validated against the ACTIVE page directory.** A system
+  call runs with the caller's `CR3` still loaded, so checking the kernel's
+  directory would accept addresses the caller cannot reach and reject ones it
+  can. Reading `CR3` works as a directory pointer only because every directory
+  is inside the identity map.
+- **Anything the kernel must write before mapping it has to be identity
+  mapped.** Page tables, a frame being zero-filled, a segment being copied in:
+  all are reached by physical address, because the address space being built
+  is not the one that is active.
+- **The identity window's headroom must cover everything that follows it, not
+  just its own page tables.** The heap, every process page directory and table,
+  every segment frame and every ring-3 stack frame come out of that reserve. At
+  64 KiB it only looked sufficient because a small initrd left megabytes of
+  slack below the 4 MiB rounding boundary; a 2 MiB initrd consumed the slack
+  and the heap alone exhausted the window, so no user task could start on a
+  machine with 128 MiB free.
 - **The idle task is a fallback, not a peer.** The scheduler skips it while
   any other task is runnable and hands it the CPU only when the caller has
   blocked or died. Scheduled as an equal, it took every other tick while the
@@ -204,10 +267,29 @@ These are deliberate boundaries, not oversights:
   writing, no creation or deletion. `readdir` returns a pointer to a single
   shared `dirent`, which is safe only while the kernel is single-threaded.
 - **Only one filesystem can be mounted**, at `/`. There is no mount table.
-- **User programs share the kernel's address space.** Ring 3 gets page-level
-  protection but no separate page directory, no ELF loader, and no fork/exec.
-  User code and constants are linked into their own page-aligned `.utext` and
-  `.urodata` sections, so they no longer share pages with kernel bytes.
+- **Two kinds of ring-3 program coexist, and only one is isolated.** A task
+  from `create_user_task` is compiled into the kernel image, runs from
+  `.utext`/`.urodata` and shares the kernel's address space, so it can reach
+  the other such tasks' pages. A process from the ELF loader gets its own page
+  directory and cannot. The first kind exists because it predates the loader.
+- **The loader is eager and non-relocating.** The whole image is read into the
+  heap and copied into frames up front: no demand paging, no `mmap`, and no
+  page cache. Only `ET_EXEC` is accepted, so there is no relocation
+  processing, no dynamic linking, and no interpreter.
+- **A process's frames must be identity-mapped.** The kernel fills them by
+  physical address, so an image large enough to push the allocator past the
+  identity window fails to load rather than falling back to a temporary
+  mapping.
+- **No `exec`, no `fork`, no `exit`, and no arguments.** A process is created
+  by the kernel at boot, gets no `argv` or environment, and cannot start
+  another. Its address space is never reclaimed: a process that faults is
+  marked dead, but its frames, page tables and page directory stay allocated
+  because there is no reaping.
+- **A page directory created after a process exists would not reach it.**
+  Address spaces share the kernel's page tables, so mappings added inside an
+  existing table propagate everywhere, but a brand-new kernel directory entry
+  would appear only in the kernel's own directory. Nothing creates one after
+  boot today.
 - **IPC is single-slot and untimed.** A mailbox holds one unread message; a
   second `send` returns `IPC_ERR_FULL` rather than queueing, and `recv` blocks
   with no timeout. Pids are assigned in creation order, never reused, and the

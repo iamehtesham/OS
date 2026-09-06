@@ -70,8 +70,18 @@ task_t *create_task(void (*entry_point)(void));
 
 /* Like create_task, but the forged frame drops into ring 3: the entry runs
  * with the user code selector on a freshly mapped user stack. The entry must
- * live in the .utext section so its page can be made user-accessible. */
+ * live in the .utext section so its page can be made user-accessible. The task
+ * shares the kernel's address space. */
 task_t *create_user_task(void (*entry_point)(void));
+
+/* Turns a loaded ELF image into a running ring-3 process: allocates a kernel
+ * stack, maps a ring-3 stack inside the process's OWN address space, forges
+ * the entry frame and links it into the run list.
+ *
+ * Takes ownership of directory_phys either way -- on failure the address space
+ * is destroyed, since a caller holding a half-built process has nothing useful
+ * left to do with it. */
+task_t *create_user_process(uint32_t entry, uint32_t directory_phys);
 
 task_t  *task_current(void);
 task_t  *task_find(uint32_t pid);

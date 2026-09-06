@@ -14,6 +14,7 @@
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
+#include "task/elf.h"
 #include "task/scheduler.h"
 #include "task/task.h"
 #include "user/ipc_demo.h"
@@ -198,6 +199,21 @@ static uint32_t memory_init(const struct multiboot_info *mbi)
     return bitmap_addr + pmm_bitmap_size();
 }
 
+/* Where the paging self-test parks its scratch mapping.
+ *
+ * It must stay OUT of the process window. This mapping is never removed, so
+ * the kernel directory keeps a page table for its 4 MiB span forever, and
+ * paging_create_address_space shares that table into every process. A process
+ * image linked inside the span would then be refused by map_into -- which is
+ * the correct refusal, but the address would be unusable for a reason that has
+ * nothing to do with the image. Sitting at 0xA0000000 it was worse than
+ * unusable: before map_into checked table ownership, a segment aimed there was
+ * written into the kernel's own page table. */
+#define PAGING_TEST_ADDRESS 0xE0000000u
+
+_Static_assert(PAGING_TEST_ADDRESS < USER_IMAGE_BASE || PAGING_TEST_ADDRESS >= USER_IMAGE_LIMIT,
+               "the paging self-test mapping must stay outside the process address window");
+
 static bool paging_test(void)
 {
     void *const frame = pmm_alloc_block();
@@ -207,7 +223,7 @@ static bool paging_test(void)
     }
 
     const uint32_t phys = (uint32_t)(uintptr_t)frame;
-    const uint32_t virt = 0xA0000000u;
+    const uint32_t virt = PAGING_TEST_ADDRESS;
 
     if (!map_page(phys, virt, PAGE_WRITABLE)) {
         return false;
@@ -353,6 +369,65 @@ static void vfs_test(const struct multiboot_info *mbi)
  * CPU lands when ring 3 traps into the kernel. */
 extern uint8_t stack_top[];
 
+/* Reads an executable out of the initrd through the VFS and starts it as a
+ * ring-3 process with an address space of its own.
+ *
+ * This is the first code here that runs a program the kernel was not linked
+ * with: everything ring 3 has executed so far was compiled into the kernel
+ * image and merely placed in user-accessible sections. */
+static void process_start(const char *name)
+{
+    if (fs_root == NULL) {
+        kprintf("Exec : no filesystem mounted, so /%s cannot be started\n", name);
+        return;
+    }
+
+    fs_node_t *const file = vfs_finddir(fs_root, name);
+
+    if (file == NULL) {
+        kprintf("Exec : /%s is not in the initrd\n", name);
+        return;
+    }
+
+    /* Staged through the heap rather than parsed where it lies: the loader
+     * wants one flat readable image, and reading it through the VFS is what
+     * makes this work against any filesystem rather than just the initrd. */
+    uint8_t *const image = kmalloc(file->length);
+
+    if (image == NULL) {
+        kprintf("Exec : no heap for a %u byte image\n", file->length);
+        return;
+    }
+
+    vfs_open(file);
+    const uint32_t got = vfs_read(file, 0, file->length, image);
+    vfs_close(file);
+
+    elf_image_t loaded;
+
+    if (got != file->length || !elf_load(image, got, &loaded)) {
+        kfree(image);
+        kprintf("Exec : /%s could not be loaded\n", name);
+        return;
+    }
+
+    /* The segments now live in frames of their own, so the staging copy has
+     * done its job. */
+    kfree(image);
+
+    task_t *const process = create_user_process(loaded.entry, loaded.directory);
+
+    if (process == NULL) {
+        kprintf("Exec : /%s loaded but could not be spawned\n", name);
+        return;
+    }
+
+    kprintf("Exec : /%s -> pid %u, entry %p, private cr3 %p\n", name, process->pid,
+            (void *)(uintptr_t)loaded.entry, (void *)(uintptr_t)loaded.directory);
+    kprintf("       %u PT_LOAD, %u pages, %u B from file + %u B zero-filled bss\n",
+            loaded.segments, loaded.pages, loaded.file_bytes, loaded.bss_bytes);
+}
+
 static void tasking_start(void)
 {
     if (!tasking_init()) {
@@ -379,6 +454,9 @@ static void tasking_start(void)
 
     kprintf("Tasks : PIT %u Hz; ring-3 receiver pid %u, sender pid %u; kernel idles\n",
             pit_frequency(), receiver->pid, sender->pid);
+
+    /* Both of those were linked into the kernel image. This one is not. */
+    process_start("dummy.elf");
 }
 
 void kernel_main(uint32_t magic, uint32_t mb_info_addr)

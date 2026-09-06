@@ -9,6 +9,7 @@
 #include "mm/pmm.h"
 #include "task/task.h"
 #include "utils/stdio.h"
+#include "utils/string.h"
 
 /* Emitted by boot.S. Declared as an array so the symbol's address is the
  * value, which is what a stack top is. */
@@ -277,6 +278,102 @@ task_t *create_user_task(void (*entry_point)(void))
     task->esp              = (uint32_t)(uintptr_t)sp;
     task->stack_base       = kernel_stack;
     task->kernel_stack_top = (uint32_t)(uintptr_t)(kernel_stack + TASK_STACK_SIZE);
+
+    task_link(task);
+
+    return task;
+}
+
+/* Allocates and maps the ring-3 stack of a process, inside its own address
+ * space. Unlike the stacks create_user_task hands out -- single frames in
+ * identity-mapped low memory, reachable from any task that shares the kernel
+ * directory -- these pages exist in exactly one page directory. */
+static bool map_process_stack(uint32_t directory_phys)
+{
+    for (uint32_t i = 0; i < USER_STACK_PAGES; i++) {
+        void *const frame = pmm_alloc_block();
+
+        if (frame == NULL) {
+            return false;
+        }
+
+        if (!paging_frame_is_reachable((uint32_t)(uintptr_t)frame)) {
+            pmm_free_block(frame);
+            return false;
+        }
+
+        /* A recycled frame still holds the last owner's bytes, and this one is
+         * about to become readable from ring 3. */
+        kmemset(frame, 0, PAGE_SIZE);
+
+        if (!paging_map_in(directory_phys, (uint32_t)(uintptr_t)frame,
+                           USER_STACK_TOP - (i + 1u) * PAGE_SIZE,
+                           PAGE_USER | PAGE_WRITABLE)) {
+            pmm_free_block(frame);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+task_t *create_user_process(uint32_t entry, uint32_t directory_phys)
+{
+    /* Every failure below frees the address space: the caller handed it over,
+     * and a directory with no task to run it is just leaked frames. */
+    if (current == NULL || entry == 0 || directory_phys == 0) {
+        paging_destroy_address_space(directory_phys);
+        return NULL;
+    }
+
+    task_t *const task = task_alloc();
+
+    if (task == NULL) {
+        paging_destroy_address_space(directory_phys);
+        return NULL;
+    }
+
+    /* Two stacks again, but this time only one of them is in the kernel's
+     * address space. The kernel stack must be: the CPU switches to it via the
+     * TSS on every trap, including traps taken while this process's CR3 is
+     * loaded, so it has to be mapped in every directory. It is, because it
+     * comes from the heap and the heap's directory entry is shared into each
+     * address space. */
+    uint8_t *const kernel_stack = kmalloc(TASK_STACK_SIZE);
+
+    if (kernel_stack == NULL) {
+        kfree(task);
+        paging_destroy_address_space(directory_phys);
+        return NULL;
+    }
+
+    if (!map_process_stack(directory_phys)) {
+        kfree(kernel_stack);
+        kfree(task);
+        paging_destroy_address_space(directory_phys);
+        return NULL;
+    }
+
+    uint32_t *sp = (uint32_t *)(void *)(kernel_stack + TASK_STACK_SIZE);
+
+    /* The same five-word ring-3 frame create_user_task forges. What differs is
+     * only where it points: an entry and a stack that exist in this process's
+     * address space and nowhere else. */
+    *--sp = GDT_USER_DATA_SELECTOR_RPL3; /* ss  */
+    *--sp = USER_STACK_TOP;              /* esp */
+    *--sp = TASK_INITIAL_EFLAGS;         /* IF set, so the timer preempts it */
+    *--sp = GDT_USER_CODE_SELECTOR_RPL3; /* cs  */
+    *--sp = entry;                       /* eip */
+
+    sp = forge_switch_frame(sp, task_bootstrap_user);
+
+    task->esp              = (uint32_t)(uintptr_t)sp;
+    task->stack_base       = kernel_stack;
+    task->kernel_stack_top = (uint32_t)(uintptr_t)(kernel_stack + TASK_STACK_SIZE);
+
+    /* The whole point: switch_task reloads CR3 when it differs from the
+     * outgoing task's, so scheduling this task changes address space. */
+    task->cr3 = directory_phys;
 
     task_link(task);
 

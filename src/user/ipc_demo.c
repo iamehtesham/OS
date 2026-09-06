@@ -76,7 +76,7 @@ static USER_TEXT void u_delay(void)
 {
     /* hlt is privileged, so a busy loop is the only way ring 3 can pace
      * itself. The timer still preempts this. */
-    for (volatile uint32_t i = 0; i < 6000000u; i++) {
+    for (volatile uint32_t i = 0; i < 30000000u; i++) {
     }
 }
 
