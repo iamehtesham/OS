@@ -9,15 +9,16 @@
 #include "drivers/keyboard.h"
 #include "drivers/vga.h"
 #include "drivers/pit.h"
-#include "fs/initrd.h"
-#include "fs/vfs.h"
+#include "ipc/mutex_proto.h"
+#include "ipc/shm_proto.h"
+#include "ipc/vfs_proto.h"
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
+#include "mm/shm.h"
 #include "task/elf.h"
 #include "task/scheduler.h"
 #include "task/task.h"
-#include "user/ipc_demo.h"
 #include "multiboot.h"
 #include "utils/stdio.h"
 #include "utils/string.h"
@@ -185,7 +186,7 @@ static uint32_t memory_init(const struct multiboot_info *mbi)
      * circulation so a NULL return from pmm_alloc_block is unambiguous. */
     pmm_reserve_region(0, 0x100000u);
     pmm_reserve_region(kernel_start, kernel_end - kernel_start);
-    pmm_reserve_region(bitmap_addr, pmm_bitmap_size());
+    pmm_reserve_region(bitmap_addr, pmm_metadata_size());
 
     /* Loader-owned ranges above 1 MiB -- module payloads especially -- sit
      * inside AVAILABLE regions and were just freed, so they need taking back
@@ -196,7 +197,7 @@ static uint32_t memory_init(const struct multiboot_info *mbi)
             mem_top / (1024u * 1024u), pmm_total_blocks(), PMM_BLOCK_SIZE / 1024u,
             pmm_free_blocks(), pmm_used_blocks());
 
-    return bitmap_addr + pmm_bitmap_size();
+    return bitmap_addr + pmm_metadata_size();
 }
 
 /* Where the paging self-test parks its scratch mapping.
@@ -277,158 +278,91 @@ static void heap_test(void)
             coalesced ? "ok" : "FAIL");
 }
 
-/* Returns the first Multiboot module's span. The initrd is handed to us this
- * way rather than read from a disk, which is the whole point of an initrd. */
-static bool multiboot_first_module(const struct multiboot_info *mbi, uint32_t *start,
-                                   uint32_t *size)
+/* The boot loader's modules, in the order the command line named them. This is
+ * the kernel's only source of anything: it has no filesystem now, so the two
+ * server binaries and the filesystem image all arrive this way. */
+/* How many processes the kernel sizes its reachable memory for. Two are loaded
+ * today; the slack costs one page table per 4 MiB of window and nothing else. */
+#define USERLAND_PROCESS_BUDGET 4u
+
+#define MODULE_VFS_SERVER 0u
+#define MODULE_CLIENT     1u
+#define MODULE_SHM_READER 2u
+#define MODULE_SHM_WRITER 3u
+#define MODULE_MUTEX_B    4u
+#define MODULE_MUTEX_A    5u
+#define MODULE_INITRD     6u
+
+/* Returns one Multiboot module's span. */
+static bool multiboot_module(const struct multiboot_info *mbi, uint32_t index,
+                             uint32_t *start, uint32_t *size)
 {
-    if ((mbi->flags & MULTIBOOT_INFO_MODS) == 0 || mbi->mods_count == 0) {
+    if ((mbi->flags & MULTIBOOT_INFO_MODS) == 0 || index >= mbi->mods_count) {
         return false;
     }
 
     const struct multiboot_mod_list *const mods =
         (const struct multiboot_mod_list *)(uintptr_t)mbi->mods_addr;
 
-    if (mods[0].mod_end <= mods[0].mod_start) {
+    if (mods[index].mod_end <= mods[index].mod_start) {
         return false;
     }
 
-    *start = mods[0].mod_start;
-    *size  = mods[0].mod_end - mods[0].mod_start;
+    *start = mods[index].mod_start;
+    *size  = mods[index].mod_end - mods[index].mod_start;
 
     return true;
-}
-
-static void vfs_test(const struct multiboot_info *mbi)
-{
-    uint32_t start;
-    uint32_t size;
-
-    if (!multiboot_first_module(mbi, &start, &size)) {
-        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
-        kprintf("\nVFS  : no Multiboot module loaded (use 'make qemu')\n");
-        return;
-    }
-
-    fs_root = initrd_init(start, size);
-
-    if (fs_root == NULL) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nVFS  : initrd failed to mount\n");
-        return;
-    }
-
-    kprintf("\nVFS  : initrd at 0x%x (%u B), %u files, '%s' mounted\n", start, size,
-            initrd_file_count(), fs_root->name);
-
-    /* Everything below goes through the vfs_* wrappers rather than the driver,
-     * so this listing would work unchanged against any filesystem that fills
-     * in readdir and finddir. */
-    for (uint32_t index = 0;; index++) {
-        struct dirent *const entry = vfs_readdir(fs_root, index);
-
-        if (entry == NULL) {
-            break;
-        }
-
-        fs_node_t *const node = vfs_finddir(fs_root, entry->name);
-
-        kprintf("  %s (%u B)\n", entry->name, node != NULL ? node->length : 0u);
-    }
-
-    fs_node_t *const file = vfs_finddir(fs_root, "hello.txt");
-
-    if (file == NULL) {
-        kprintf("  hello.txt not found\n");
-        return;
-    }
-
-    vfs_open(file);
-
-    uint8_t        buffer[128];
-    const uint32_t got = vfs_read(file, 0, (uint32_t)sizeof(buffer) - 1u, buffer);
-
-    buffer[got] = '\0';
-
-    vfs_close(file);
-
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    kprintf("\ncat /%s (%u of %u B):\n", file->name, got, file->length);
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-    kprintf("%s", (const char *)buffer);
-
-    /* The image is read-only, so the write slot reports zero bytes written
-     * rather than pretending to succeed. */
-    const uint8_t byte = 'x';
-
-    kprintf("vfs_write on a read-only file returned %u bytes\n",
-            vfs_write(file, 0, 1, &byte));
 }
 
 /* Emitted by boot.S: the top of the original kernel stack, which is where the
  * CPU lands when ring 3 traps into the kernel. */
 extern uint8_t stack_top[];
 
-/* Reads an executable out of the initrd through the VFS and starts it as a
- * ring-3 process with an address space of its own.
+/* Loads a Multiboot module as a ring-3 process.
  *
- * This is the first code here that runs a program the kernel was not linked
- * with: everything ring 3 has executed so far was compiled into the kernel
- * image and merely placed in user-accessible sections. */
-static void process_start(const char *name)
+ * The module is already a flat image in identity-mapped memory, reserved by
+ * the physical allocator, so the loader reads it where it lies. That is what
+ * lets the kernel bootstrap userland with no filesystem of its own: the boot
+ * loader hands it the bytes, and everything after the first process is the
+ * first process's problem. */
+static task_t *process_start_module(const struct multiboot_info *mbi, uint32_t index,
+                                    const char *label)
 {
-    if (fs_root == NULL) {
-        kprintf("Exec : no filesystem mounted, so /%s cannot be started\n", name);
-        return;
+    uint32_t start;
+    uint32_t size;
+
+    if (!multiboot_module(mbi, index, &start, &size)) {
+        kprintf("Exec : module %u (%s) was not supplied\n", index, label);
+        return NULL;
     }
-
-    fs_node_t *const file = vfs_finddir(fs_root, name);
-
-    if (file == NULL) {
-        kprintf("Exec : /%s is not in the initrd\n", name);
-        return;
-    }
-
-    /* Staged through the heap rather than parsed where it lies: the loader
-     * wants one flat readable image, and reading it through the VFS is what
-     * makes this work against any filesystem rather than just the initrd. */
-    uint8_t *const image = kmalloc(file->length);
-
-    if (image == NULL) {
-        kprintf("Exec : no heap for a %u byte image\n", file->length);
-        return;
-    }
-
-    vfs_open(file);
-    const uint32_t got = vfs_read(file, 0, file->length, image);
-    vfs_close(file);
 
     elf_image_t loaded;
 
-    if (got != file->length || !elf_load(image, got, &loaded)) {
-        kfree(image);
-        kprintf("Exec : /%s could not be loaded\n", name);
-        return;
+    if (!elf_load((const void *)(uintptr_t)start, size, &loaded)) {
+        kprintf("Exec : %s could not be loaded\n", label);
+        return NULL;
     }
-
-    /* The segments now live in frames of their own, so the staging copy has
-     * done its job. */
-    kfree(image);
 
     task_t *const process = create_user_process(loaded.entry, loaded.directory);
 
     if (process == NULL) {
-        kprintf("Exec : /%s loaded but could not be spawned\n", name);
-        return;
+        kprintf("Exec : %s loaded but could not be spawned\n", label);
+        return NULL;
     }
 
-    kprintf("Exec : /%s -> pid %u, entry %p, private cr3 %p\n", name, process->pid,
-            (void *)(uintptr_t)loaded.entry, (void *)(uintptr_t)loaded.directory);
-    kprintf("       %u PT_LOAD, %u pages, %u B from file + %u B zero-filled bss\n",
-            loaded.segments, loaded.pages, loaded.file_bytes, loaded.bss_bytes);
+    kprintf("Exec : %s -> pid %u, %u pages, %u B bss, cr3 %p\n", label, process->pid,
+            loaded.pages, loaded.bss_bytes, (void *)(uintptr_t)loaded.directory);
+
+    return process;
 }
 
-static void tasking_start(void)
+/* Brings up multitasking and starts userland.
+ *
+ * This is where the kernel stops. It has no filesystem, no drivers beyond the
+ * console and the two chips it needs to schedule, and no idea what a file is.
+ * It loads two programs the boot loader handed it, tells one of them where the
+ * filesystem image lives, and idles. */
+static void userland_start(const struct multiboot_info *mbi)
 {
     if (!tasking_init()) {
         vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
@@ -437,26 +371,76 @@ static void tasking_start(void)
     }
 
     /* Order matters: the chip and the hook must both be live before the first
-     * tick can arrive, and no tick can arrive until sti below. */
+     * tick can arrive, and no tick can arrive until sti in kernel_main. */
     pit_init(100);
     scheduler_init();
 
-    /* The receiver is created first so it gets IPC_DEMO_RECEIVER_PID, which is
-     * the pid the sender addresses. */
-    task_t *const receiver = create_user_task(ipc_demo_receiver);
-    task_t *const sender   = create_user_task(ipc_demo_sender);
+    /* The server is created first so it takes the pid its clients are compiled
+     * to address. Pids are handed out in creation order after the idle task's
+     * 0, so this is the arrangement that makes VFS_SERVER_PID true rather than
+     * merely hoped for -- and it is checked below rather than assumed. */
+    task_t *const server = process_start_module(mbi, MODULE_VFS_SERVER, "vfs_server.elf");
 
-    if (receiver == NULL || sender == NULL) {
+    if (server == NULL) {
         vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nCould not create the user tasks.\n");
+        kprintf("\nNo VFS server: userland cannot start.\n");
         return;
     }
 
-    kprintf("Tasks : PIT %u Hz; ring-3 receiver pid %u, sender pid %u; kernel idles\n",
-            pit_frequency(), receiver->pid, sender->pid);
+    if (server->pid != VFS_SERVER_PID) {
+        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
+        kprintf("Warn : VFS server is pid %u but clients address %u\n", server->pid,
+                VFS_SERVER_PID);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
 
-    /* Both of those were linked into the kernel image. This one is not. */
-    process_start("dummy.elf");
+    /* The one privilege that separates the server from any other program: it
+     * may map the physical range holding the filesystem image, and nothing
+     * else. The range comes from the boot loader's module list, so no user
+     * program has a say in it -- and the grant must be recorded before the
+     * server can run, which is guaranteed because interrupts are still off. */
+    uint32_t initrd_start;
+    uint32_t initrd_size;
+
+    if (multiboot_module(mbi, MODULE_INITRD, &initrd_start, &initrd_size)) {
+        task_grant_physical(server, initrd_start, initrd_size);
+        kprintf("Grant: pid %u may map phys 0x%x + %u B (the filesystem image)\n",
+                server->pid, initrd_start, initrd_size);
+    } else {
+        kprintf("Grant: no filesystem image supplied; the server will serve nothing\n");
+    }
+
+    process_start_module(mbi, MODULE_CLIENT, "client.elf");
+
+    /* The reader is started before the writer so it is already blocked in recv
+     * when the offer arrives, and so it takes the pid the writer is compiled to
+     * address. Checked, not assumed -- the same arrangement as the VFS server's
+     * well-known pid, and the same failure if it silently stopped holding. */
+    task_t *const reader = process_start_module(mbi, MODULE_SHM_READER, "shm_reader.elf");
+
+    if (reader != NULL && reader->pid != SHM_READER_PID) {
+        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
+        kprintf("Warn : shm reader is pid %u but the writer addresses %u\n", reader->pid,
+                SHM_READER_PID);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+
+    process_start_module(mbi, MODULE_SHM_WRITER, "shm_writer.elf");
+
+    /* B before A, so B holds the pid A is compiled to address and is already
+     * blocked in recv when A offers it the page. */
+    task_t *const mutex_b = process_start_module(mbi, MODULE_MUTEX_B, "mutex_b.elf");
+
+    if (mutex_b != NULL && mutex_b->pid != MUTEX_B_PID) {
+        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
+        kprintf("Warn : mutex B is pid %u but A addresses %u\n", mutex_b->pid, MUTEX_B_PID);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+
+    process_start_module(mbi, MODULE_MUTEX_A, "mutex_a.elf");
+
+    kprintf("Sched: PIT %u Hz round robin over %u tasks; the kernel idles\n",
+            pit_frequency(), task_count());
 }
 
 void kernel_main(uint32_t magic, uint32_t mb_info_addr)
@@ -491,7 +475,12 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
         const uint32_t protected_end = memory_init(mbi);
 
         if (protected_end != 0) {
-            paging_init();
+            /* What the kernel will still allocate from identity-reachable
+             * memory after this point: the heap, plus room for the processes
+             * it is about to load. Stating it here rather than hiding it in a
+             * constant is what keeps a bigger program from silently running
+             * the window out. */
+            paging_init(KHEAP_SIZE + USERLAND_PROCESS_BUDGET * PAGING_PROCESS_RESERVE);
 
             if (paging_is_enabled()) {
                 kprintf("Paging: identity 0x0-0x%x, CR0.PG+WP set, test map %s\n",
@@ -499,7 +488,11 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
 
                 if (kheap_init()) {
                     heap_test();
-                    vfs_test(mbi);
+
+                    /* Everything above this line is the kernel. Everything
+                     * below it runs in ring 3. */
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    userland_start(mbi);
                 } else {
                     vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
                     kprintf("\nHeap failed to initialise.\n");
@@ -514,13 +507,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
         kprintf("\nNot entered by a Multiboot loader -- no memory map available.\n");
     }
 
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-    tasking_start();
-
     __asm__ volatile ("sti");
 
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-    kprintf("\nInterrupts on. Two ring-3 tasks pass messages through int 0x80:\n\n");
+    kprintf("\nInterrupts on. The filesystem now lives in ring 3:\n\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
     /* The kernel thread is the idle task. It never blocks and never dies, so
@@ -529,6 +519,23 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
      * scheduler only picks it when nothing else is runnable, so hlt here means
      * the whole machine genuinely has nothing to do until the next interrupt. */
     for (;;) {
+        /* Reaping happens HERE, and only here, because a process cannot free
+         * the page directory it is executing on -- the directory being torn
+         * down is the one translating the instruction doing the tearing. The
+         * idle task runs on the kernel's own address space and is the one task
+         * guaranteed to exist, so it is the safe place to do it.
+         *
+         * Tearing down an address space drops a reference on every frame it
+         * mapped. Private pages reach zero and are freed; a shared page merely
+         * loses one holder. Collecting afterwards retires any segment whose
+         * last holder has now gone. */
+        if (task_reap_dead() > 0) {
+            const uint32_t retired = shm_collect();
+
+            kprintf("Reap : freed a dead process; %u shm segment(s) retired, %u frames free\n",
+                    retired, pmm_free_blocks());
+        }
+
         __asm__ volatile ("hlt");
     }
 }

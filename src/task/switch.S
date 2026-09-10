@@ -14,8 +14,8 @@
  *     ESP -> [edi][esi][ebp][esp][ebx][edx][ecx][eax]   pusha, 32 bytes
  *            [return address]                           pushed by the call
  *
- * create_task forges that same shape by hand, which is what lets a task that
- * has never executed be resumed by the identical code path. */
+ * create_user_process forges that same shape by hand, which is what lets a
+ * process that has never executed be resumed by the identical code path. */
 .global switch_task
 .type switch_task, @function
 switch_task:
@@ -45,23 +45,14 @@ switch_task:
 .size switch_task, . - switch_task
 
 
-/* Entry point for a ring-0 task being scheduled for the very first time.
+/* Entry point for a process being scheduled for the very first time.
  *
  * switch_task's `ret` arrives here still inside the timer interrupt, with IF
  * clear because the gate cleared it. The PIC has already been acknowledged --
  * irq_handler does that before dispatching -- so all that remains is to iret
- * off the frame create_task forged. The iret restores EIP, CS and EFLAGS
- * together, and it is the EFLAGS that turns interrupts back on, atomically, in
- * the same instruction that enters the task. */
-.global task_bootstrap
-.type task_bootstrap, @function
-task_bootstrap:
-    iret
-
-.size task_bootstrap, . - task_bootstrap
-
-
-/* Same, for a task whose forged frame lands in ring 3.
+ * off the frame create_user_process forged. The iret restores EIP, CS and
+ * EFLAGS together, and it is the EFLAGS that turns interrupts back on,
+ * atomically, in the same instruction that enters the process.
  *
  * iret restores CS and SS but not the data segment registers, and on a return
  * to a less privileged level the CPU nulls any of those still holding a

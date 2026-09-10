@@ -34,16 +34,26 @@ INITRD_DIR  := initrd
 INITRD_TOOL := tools/make_initrd.py
 INITRD_IMG  := $(BUILD_DIR)/initrd.img
 
-# Standalone ring-3 programs. These are NOT part of the kernel: each is linked
-# into its own ET_EXEC ELF binary, packed into the initrd, and loaded at run
-# time by src/task/elf.c into an address space of its own. They therefore have
-# to be kept out of the kernel's source discovery below -- linking one in would
+# Ring-3 programs. These are NOT part of the kernel: each is a directory under
+# src/user/ linked into its own ET_EXEC binary and handed to the kernel as a
+# Multiboot module, which loads it into an address space of its own. They are
+# pruned from the kernel's source discovery below -- linking one in would
 # collide with the kernel's own _start and put user code in kernel pages.
-USER_PROG_DIR  := $(SRC_DIR)/user/programs
-USER_LINKER    := user.ld
-USER_PROG_SRCS := $(sort $(wildcard $(USER_PROG_DIR)/*.c))
-USER_PROGS     := $(patsubst $(USER_PROG_DIR)/%.c,$(INITRD_DIR)/%.elf,$(USER_PROG_SRCS))
-USER_OBJS      := $(patsubst $(USER_PROG_DIR)/%.c,$(BUILD_DIR)/user/programs/%.o,$(USER_PROG_SRCS))
+#
+# Everything in src/user/lib is linked into every program. There is no dynamic
+# linker and each process has a private address space, so a shared library
+# would have nothing to share; duplicating a few hundred bytes is the whole
+# cost of not having one.
+USER_DIR      := $(SRC_DIR)/user
+USER_LIB_DIR  := $(USER_DIR)/lib
+USER_LINKER   := user.ld
+USER_PROGRAMS := vfs_server client shm_reader shm_writer mutex_b mutex_a
+
+USER_LIB_SRCS := $(sort $(wildcard $(USER_LIB_DIR)/*.c)) $(sort $(wildcard $(USER_LIB_DIR)/*.S))
+USER_LIB_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,\
+                   $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(USER_LIB_SRCS)))
+USER_PROGS    := $(patsubst %,$(BUILD_DIR)/%.elf,$(USER_PROGRAMS))
+USER_OBJS     := $(USER_LIB_OBJS)
 
 # -fno-pie / -fno-pic: Ubuntu's GCC defaults to PIE, but linker.ld pins us to a
 #   fixed load address at 1 MiB.
@@ -72,11 +82,16 @@ ULDFLAGS := -m elf_i386 -T $(USER_LINKER) -nostdlib --build-id=none \
 # Sources are discovered recursively so new subsystems under src/ need no edit
 # here; sorted to keep the link order reproducible. The standalone ring-3
 # programs are pruned: they are separate binaries, not kernel objects.
-C_SRCS := $(sort $(shell find $(SRC_DIR) -path $(USER_PROG_DIR) -prune -o -name '*.c' -print))
-S_SRCS := $(sort $(shell find $(SRC_DIR) -name '*.S'))
+# BOTH discoveries prune src/user, not just the C one. Assembly is exactly what
+# a libc-less user runtime reaches for -- a syscall trampoline, a hand-written
+# _start -- and an unpruned .S would be assembled into the kernel while the
+# program that needs it fails to resolve the symbol. A user _start would
+# collide with boot.S's outright.
+C_SRCS := $(sort $(shell find $(SRC_DIR) -path $(USER_DIR) -prune -o -name '*.c' -print))
+S_SRCS := $(sort $(shell find $(SRC_DIR) -path $(USER_DIR) -prune -o -name '*.S' -print))
 OBJS   := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(S_SRCS)) \
           $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(C_SRCS))
-DEPS   := $(OBJS:.o=.d) $(USER_OBJS:.o=.d)
+DEPS   := $(OBJS:.o=.d)
 
 .PHONY: all build qemu check screenshot clean force-initrd
 
@@ -93,22 +108,30 @@ DEPS   := $(OBJS:.o=.d) $(USER_OBJS:.o=.d)
 
 all: build
 
-build: $(KERNEL) $(INITRD_IMG)
+build: $(KERNEL) $(INITRD_IMG) $(USER_PROGS)
 
 # Always out of date, so the initrd recipe runs every build and decides for
 # itself whether the image actually changed.
 force-initrd:
 
-# Each ring-3 program is compiled and linked on its own, then dropped into the
-# initrd source directory so the packer picks it up like any other file.
-$(BUILD_DIR)/user/programs/%.o: $(USER_PROG_DIR)/%.c $(MAKEFILE_DEPS)
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+# One rule per program, generated: each links every .c in its own directory
+# plus the shared user runtime. A new program is a new directory and a name in
+# USER_PROGRAMS, with no other Makefile edit.
+define USER_PROGRAM_RULE
+$(1)_SRCS := $$(sort $$(wildcard $$(USER_DIR)/$(1)/*.c)) \
+             $$(sort $$(wildcard $$(USER_DIR)/$(1)/*.S)) $$(USER_LIB_SRCS)
+$(1)_OBJS := $$(patsubst $$(SRC_DIR)/%.c,$$(BUILD_DIR)/%.o,\
+               $$(patsubst $$(SRC_DIR)/%.S,$$(BUILD_DIR)/%.o,$$($(1)_SRCS)))
+USER_OBJS += $$($(1)_OBJS)
 
-$(INITRD_DIR)/%.elf: $(BUILD_DIR)/user/programs/%.o $(USER_LINKER) $(MAKEFILE_DEPS)
-	$(LD) $(ULDFLAGS) -o $@ $<
+$$(BUILD_DIR)/$(1).elf: $$($(1)_OBJS) $$(USER_LINKER) $$(MAKEFILE_DEPS)
+	@mkdir -p $$(@D)
+	$$(LD) $$(ULDFLAGS) -o $$@ $$($(1)_OBJS)
+endef
 
-$(INITRD_IMG): force-initrd $(USER_PROGS)
+$(foreach prog,$(USER_PROGRAMS),$(eval $(call USER_PROGRAM_RULE,$(prog))))
+
+$(INITRD_IMG): force-initrd
 	@mkdir -p $(@D)
 	@python3 $(INITRD_TOOL) $(INITRD_DIR) $@.new > $@.log
 	@if cmp -s $@.new $@ 2>/dev/null; then \
@@ -133,10 +156,23 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(MAKEFILE_DEPS)
 $(KERNEL): $(OBJS) $(LINKER) $(MAKEFILE_DEPS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
+# The kernel has no filesystem, so everything userland needs arrives as a
+# Multiboot module. ORDER IS THE CONTRACT: src/kernel.c indexes this list by
+# position (MODULE_VFS_SERVER, MODULE_CLIENT, MODULE_INITRD), so reordering it
+# here silently starts the wrong program and grants the wrong memory.
+COMMA := ,
+EMPTY :=
+SPACE := $(EMPTY) $(EMPTY)
+MODULES     := $(BUILD_DIR)/vfs_server.elf $(BUILD_DIR)/client.elf \
+               $(BUILD_DIR)/shm_reader.elf $(BUILD_DIR)/shm_writer.elf \
+               $(BUILD_DIR)/mutex_b.elf $(BUILD_DIR)/mutex_a.elf $(INITRD_IMG)
+MODULE_LIST := $(subst $(SPACE),$(COMMA),$(strip $(MODULES)))
+
 # Boot the ELF image directly: QEMU implements the Multiboot loader itself, so
-# no GRUB, ISO or disk image is involved.
-qemu: $(KERNEL) $(INITRD_IMG)
-	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD_IMG)
+# no GRUB, ISO or disk image is involved. -initrd takes the whole comma
+# separated list and presents it as the module array.
+qemu: build
+	$(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST)
 
 # Confirms the Multiboot 1 header is present, aligned and correctly checksummed.
 check: $(KERNEL)
@@ -145,12 +181,12 @@ check: $(KERNEL)
 		|| { echo "Multiboot 1 header: MISSING"; exit 1; }
 
 # Headless boot that dumps the framebuffer to a PPM, for machines with no display.
-screenshot: $(KERNEL) $(INITRD_IMG)
+screenshot: build
 	@{ sleep 1; printf 'screendump $(BUILD_DIR)/screen.ppm\nquit\n'; } \
-		| $(QEMU) -kernel $(KERNEL) -initrd $(INITRD_IMG) -display none -monitor stdio > /dev/null
+		| $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) -display none -monitor stdio > /dev/null
 	@echo "Wrote $(BUILD_DIR)/screen.ppm"
 
 clean:
-	rm -rf $(BUILD_DIR) $(USER_PROGS)
+	rm -rf $(BUILD_DIR)
 
--include $(DEPS)
+-include $(DEPS) $(USER_OBJS:.o=.d)

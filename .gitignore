@@ -11,5 +11,3 @@ NOTES.md
 *~
 .DS_Store
 
-# Ring-3 programs built into the initrd source directory by the Makefile.
-initrd/*.elf

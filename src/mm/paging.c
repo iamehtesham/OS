@@ -145,8 +145,22 @@ static bool map_into(page_entry_t *dir, uint32_t physical_addr, uint32_t virtual
     page_entry_t *const table =
         (page_entry_t *)(uintptr_t)(dir[dir_index] & PAGE_FRAME_MASK);
 
+    const uint32_t previous = table[table_index];
+
     table[table_index] =
         (physical_addr & PAGE_FRAME_MASK) | (flags & ~PAGE_FRAME_MASK) | PAGE_PRESENT;
+
+    /* Replacing a live mapping with a DIFFERENT frame: the old frame just lost
+     * this reference, and nothing else would ever notice. It would stay
+     * allocated with a count that no page table backs, unreachable and
+     * unfreeable for the life of the machine. Re-mapping the SAME frame is not
+     * a replacement -- the ELF loader does it to widen permissions on a page two
+     * segments share -- so the frames are compared rather than just the
+     * present bit. */
+    if ((previous & PAGE_PRESENT) != 0 &&
+        (previous & PAGE_FRAME_MASK) != (physical_addr & PAGE_FRAME_MASK)) {
+        pmm_free_block((void *)(uintptr_t)(previous & PAGE_FRAME_MASK));
+    }
 
     tlb_invalidate(virtual_addr);
 
@@ -269,7 +283,7 @@ void paging_destroy_address_space(uint32_t directory_phys)
     pmm_free_block(dir);
 }
 
-void paging_init(void)
+void paging_init(uint32_t extra_reserve)
 {
     void *const dir_frame = pmm_alloc_block();
 
@@ -277,6 +291,14 @@ void paging_init(void)
         kprintf("paging: no free frame for the page directory\n");
         return;
     }
+
+    /* Zeroed for exactly the reason every page table is: pmm_alloc_block hands
+     * back whatever bytes the frame held, and a stray Present bit in an entry
+     * for a range nothing maps would name a garbage table. Worse here than in a
+     * table, because paging_create_address_space copies every present directory
+     * entry into every process, so one leftover bit would propagate that
+     * garbage into every address space on the machine. */
+    zero_frame(dir_frame);
 
     page_directory_phys = (uint32_t)(uintptr_t)dir_frame;
     page_directory      = (page_entry_t *)(uintptr_t)dir_frame;
@@ -302,10 +324,15 @@ void paging_init(void)
          * set, and those come from the first free frame. Land the window flush
          * against the mark and that frame is outside it, so every later
          * mapping fails the reachability guard -- which is how a mid-sized
-         * Multiboot module can leave the kernel with no heap at all. */
-        if (required <= UINT32_MAX - PAGING_TABLE_RESERVE) {
-            const uint32_t wanted = align_up(required + PAGING_TABLE_RESERVE,
-                                             PAGING_DIRECTORY_SPAN);
+         * Multiboot module can leave the kernel with no heap at all.
+         *
+         * The caller's extra_reserve is added because the tables are only the
+         * beginning: the heap and every process's frames come out of the same
+         * window, and how much that is depends on what is being loaded. */
+        const uint32_t headroom = PAGING_TABLE_RESERVE + extra_reserve;
+
+        if (required <= UINT32_MAX - headroom) {
+            const uint32_t wanted = align_up(required + headroom, PAGING_DIRECTORY_SPAN);
 
             /* align_up wraps to 0 within one span of the top of memory; only
              * take the new value when it is genuinely an increase. */
@@ -336,6 +363,16 @@ void paging_init(void)
         kprintf("paging: no reachable frames left below 0x%x\n", identity_limit);
         page_directory = NULL;
         return;
+    }
+
+    /* Reachable free space is what every later allocation draws on, so report
+     * it rather than leaving a shortfall to surface as an unexplained failure
+     * to start a process several screens later. */
+    const uint32_t reachable_free = identity_limit - pmm_highest_used_address();
+
+    if (reachable_free < extra_reserve) {
+        kprintf("paging: only %u KiB reachable below 0x%x, %u KiB wanted\n",
+                reachable_free / 1024u, identity_limit, extra_reserve / 1024u);
     }
 
     paging_enable(page_directory_phys);

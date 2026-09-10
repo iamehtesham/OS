@@ -43,4 +43,12 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size);
 
 uint32_t initrd_file_count(void);
 
+/* Resolves the inode a previous lookup handed out. The server gives a client
+ * an inode rather than a pointer, because a pointer into the server's address
+ * space would mean nothing in the client's -- and would be a capability the
+ * client could forge if it did. */
+fs_node_t *initrd_node_by_inode(uint32_t inode);
+
+uint32_t initrd_image_size(void);
+
 #endif /* FS_INITRD_H */

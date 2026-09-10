@@ -38,22 +38,21 @@
  * a whole number of these, since each one costs exactly one page table. */
 #define PAGING_DIRECTORY_SPAN 0x400000u
 
-/* Frames kept free BELOW the identity window for everything the kernel must
- * still be able to address directly once CR0.PG is set. Growing the window to
- * exactly the allocator's high-water mark is not enough: the tables built
- * while growing it raise that mark themselves, so the fixed point can settle
- * with no reachable frame left and every later mapping failing the
- * reachability guard.
+/* Frames kept free BELOW the identity window for the page tables paging_init
+ * must itself allocate while growing that window. Growing to exactly the
+ * allocator's high-water mark is not enough: the tables built while growing it
+ * raise that mark themselves, so the fixed point can settle with no reachable
+ * frame left and every later mapping failing the reachability guard.
  *
- * The reserve has to cover far more than those tables, because everything the
- * kernel fills by physical address comes out of it: the 1 MiB kernel heap and
- * its tables, each process's page directory and page tables, every ELF segment
- * frame the loader zero-fills, and every ring-3 stack frame. Sized at 64 KiB
- * this was invisible only because a small initrd happened to leave megabytes
- * of slack below the 4 MiB rounding; a 2 MiB initrd consumed that slack and
- * the heap alone exhausted the window, disabling the loader and then ring 3
- * on a machine with 128 MiB of free RAM. */
-#define PAGING_TABLE_RESERVE (512u * PAGE_SIZE) /* 2 MiB */
+ * This covers ONLY those tables. Everything allocated after paging is on is
+ * accounted for by paging_init's extra_reserve argument, because a constant
+ * cannot know how big the programs being loaded are. */
+#define PAGING_TABLE_RESERVE (64u * PAGE_SIZE) /* 256 KiB, i.e. 64 page tables */
+
+/* What one process costs in identity-reachable frames: a page directory, a few
+ * page tables, its ELF segments and its ring-3 stack. Generous, since being
+ * wrong downward means a process that cannot start. */
+#define PAGING_PROCESS_RESERVE (256u * PAGE_SIZE) /* 1 MiB each */
 
 /* Layout of a process address space, as built by the ELF loader.
  *
@@ -70,8 +69,30 @@
 #define USER_STACK_BOTTOM (USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE)
 #define USER_IMAGE_LIMIT  USER_STACK_BOTTOM
 
-/* Builds the page directory, identity-maps the low 4 MiB and turns on the MMU. */
-void paging_init(void);
+/* Where SYS_MAP_PHYSICAL lands a granted physical range. The kernel picks the
+ * address rather than the caller: letting a process choose invites it to map
+ * over its own stack or its own image, which turns a mapping call into a way
+ * to corrupt itself. Far above where an image is linked, so a server can map
+ * its grant without colliding with anything it already owns. */
+#define USER_MAP_BASE  0x50000000u
+#define USER_MAP_LIMIT 0x60000000u
+
+/* Where shared segments land in a process. Its own window, disjoint from the
+ * image, the stack and the physical-map window, so a bump allocator over it
+ * cannot collide with anything the process already owns. */
+#define SHM_WINDOW_BASE  0xA0000000u
+#define SHM_WINDOW_LIMIT 0xB0000000u
+
+/* Builds the page directory, identity-maps low memory and turns on the MMU.
+ *
+ * `extra_reserve` is how many bytes of identity-reachable memory the caller
+ * still intends to allocate AFTER paging is on, on top of the page tables this
+ * function needs for itself. Everything the kernel later fills by physical
+ * address comes out of it: the heap, each process's page directory and tables,
+ * every ELF segment frame, every ring-3 stack frame. Passing a fixed constant
+ * is what previously left a machine with 100 MiB free unable to start a second
+ * process, so the caller computes it from what it is actually going to do. */
+void paging_init(uint32_t extra_reserve);
 
 /* Maps one 4 KiB page, allocating a page table from the PMM if the directory
  * has none for that range. Returns false if a frame could not be obtained, or

@@ -57,22 +57,35 @@ typedef struct task {
      * parked in the kernel task's mailbox forever. */
     bool can_receive;
 
+    /* May this task ask the kernel to map physical memory at all, and if so,
+     * which physical memory.
+     *
+     * Two fields rather than one because they answer different questions and
+     * neither alone is sufficient. The flag is WHO: a bit ring 3 cannot read
+     * or write, since the control block sits on a supervisor page and no
+     * system call sets it. The range is WHAT: a grant recorded by the kernel
+     * from the boot loader's module list when the task is created, never
+     * derived from anything the caller says. A flag on its own would make a
+     * server as dangerous as the kernel, because one parser bug in ring 3
+     * would reach kernel text. */
+    bool     may_map_physical;
+    uint32_t grant_base;   /* physical, exactly as the loader reported it */
+    uint32_t grant_length; /* bytes; zero means no grant                  */
+
+    /* Next free page in this process's shared-memory window. A bump allocator:
+     * it only ever moves forward, so an address handed out once is never handed
+     * out again and an attach can never land on top of a mapping the process is
+     * already using. The cost is that detaching reclaims no address space,
+     * which is bounded by the window and is the right trade at this size. */
+    uint32_t shm_next_vaddr;
+
     struct task *next; /* circular, so round-robin is just ->next */
 } task_t;
 
 /* Turns the currently executing kernel thread into a task so the scheduler has
- * something to switch away from and back to. Must run before create_task. */
+ * something to switch away from and back to. Must run before any process is
+ * created: it is what makes the kernel thread the idle task. */
 bool tasking_init(void);
-
-/* Allocates a stack, forges an initial frame on it that switch_task can resume,
- * and appends the task to the run list. Returns null if memory ran out. */
-task_t *create_task(void (*entry_point)(void));
-
-/* Like create_task, but the forged frame drops into ring 3: the entry runs
- * with the user code selector on a freshly mapped user stack. The entry must
- * live in the .utext section so its page can be made user-accessible. The task
- * shares the kernel's address space. */
-task_t *create_user_task(void (*entry_point)(void));
 
 /* Turns a loaded ELF image into a running ring-3 process: allocates a kernel
  * stack, maps a ring-3 stack inside the process's OWN address space, forges
@@ -82,6 +95,30 @@ task_t *create_user_task(void (*entry_point)(void));
  * is destroyed, since a caller holding a half-built process has nothing useful
  * left to do with it. */
 task_t *create_user_process(uint32_t entry, uint32_t directory_phys);
+
+/* Privileges a task to map one physical range, and only that range.
+ *
+ * Callable only from ring 0, and only with a range the kernel itself learned
+ * from the boot loader -- that is the whole security property. The range is
+ * stored exactly as given; SYS_MAP_PHYSICAL rounds outward to pages when it
+ * maps, so a server sees whole pages and the slack either side of a module,
+ * never anything outside it. */
+void task_grant_physical(task_t *task, uint32_t base, uint32_t length);
+
+/* Reserves the next page of a task's shared-memory window and returns it, or 0
+ * when the window is exhausted. */
+uint32_t task_reserve_shm_vaddr(task_t *task);
+
+/* Unlinks every dead task and releases everything it held: its address space
+ * -- which decrements a reference on every frame it had mapped, freeing the
+ * private ones and leaving shared ones for their other holders -- then its
+ * kernel stack and its control block. Returns how many were reaped.
+ *
+ * MUST be called from a task that is not itself being reaped, and whose address
+ * space is not one being destroyed. The idle task is the one place both are
+ * guaranteed: a process cannot free the page directory it is currently
+ * executing on, so the work has to happen after something else is running. */
+uint32_t task_reap_dead(void);
 
 task_t  *task_current(void);
 task_t  *task_find(uint32_t pid);
@@ -102,10 +139,8 @@ void task_switch_to(task_t *next);
  * differs, and resumes whatever that stack was doing. */
 void switch_task(uint32_t *save_esp, uint32_t new_esp, uint32_t new_cr3);
 
-/* Landing pad for a task function that returns. Also in switch.S is
- * task_bootstrap, which is where a brand-new task's forged frame begins. */
-void task_exit(void);
-void task_bootstrap(void);
+/* In switch.S: where a brand-new process's forged frame begins. It loads the
+ * ring-3 data selectors and irets into user mode. */
 void task_bootstrap_user(void);
 
 #endif /* TASK_TASK_H */

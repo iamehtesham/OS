@@ -15,18 +15,10 @@
  * value, which is what a stack top is. */
 extern uint8_t stack_top[];
 
-/* Bracket the .utext and .urodata sections that linker.ld lays out on their
- * own pages, so ring-3 code can be mapped without exposing kernel bytes. */
-extern uint8_t __user_text_start[];
-extern uint8_t __user_text_end[];
-extern uint8_t __user_rodata_start[];
-extern uint8_t __user_rodata_end[];
-
 static task_t  *current;
 static task_t  *idle_task;
 static uint32_t next_pid;
 static uint32_t task_total;
-static bool     user_pages_mapped;
 
 /* The run list is walked from an interrupt, so it must never be observed
  * half-linked. These bracket the few instructions that mutate it. */
@@ -44,47 +36,6 @@ static void interrupts_restore(bool were_enabled)
     if (were_enabled) {
         __asm__ volatile ("sti" ::: "memory");
     }
-}
-
-void task_exit(void)
-{
-    /* A ring-0 task function returned. Mark it so the scheduler never picks it
-     * again, then wait to be switched away from. There is no reaping yet: the
-     * stack stays allocated, and a send to this pid is refused. */
-    if (current != NULL) {
-        current->state = TASK_DEAD;
-    }
-
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
-}
-
-/* Maps the user code and constants sections user-accessible, once. Neither
- * gets the writable bit: ring 3 may execute and read them, nothing more. The
- * linker page-aligns both, so no kernel code or data shares the pages. */
-static bool user_pages_init(void)
-{
-    if (user_pages_mapped) {
-        return true;
-    }
-
-    const uint32_t ranges[2][2] = {
-        { (uint32_t)(uintptr_t)__user_text_start, (uint32_t)(uintptr_t)__user_text_end },
-        { (uint32_t)(uintptr_t)__user_rodata_start, (uint32_t)(uintptr_t)__user_rodata_end },
-    };
-
-    for (uint32_t r = 0; r < 2; r++) {
-        for (uint32_t page = ranges[r][0]; page < ranges[r][1]; page += PAGE_SIZE) {
-            if (!map_page(page, page, PAGE_USER)) {
-                return false;
-            }
-        }
-    }
-
-    user_pages_mapped = true;
-
-    return true;
 }
 
 /* Appends to the ring so tasks run in creation order. */
@@ -122,7 +73,88 @@ static task_t *task_alloc(void)
     task->esp          = 0;
     task->next         = NULL;
 
+    /* Default-deny, like the physical allocator: a task holds no privilege
+     * until the kernel deliberately hands it one. */
+    task->may_map_physical = false;
+    task->grant_base       = 0;
+    task->grant_length     = 0;
+
+    task->shm_next_vaddr = SHM_WINDOW_BASE;
+
     return task;
+}
+
+uint32_t task_reserve_shm_vaddr(task_t *task)
+{
+    if (task == NULL || task->shm_next_vaddr >= SHM_WINDOW_LIMIT) {
+        return 0;
+    }
+
+    const uint32_t reserved = task->shm_next_vaddr;
+
+    task->shm_next_vaddr += PAGE_SIZE;
+
+    return reserved;
+}
+
+uint32_t task_reap_dead(void)
+{
+    uint32_t reaped = 0;
+
+    for (;;) {
+        const bool were_enabled = interrupts_disable();
+
+        /* Walk from the caller, so the caller itself is never a candidate --
+         * which is what keeps this from freeing the stack it is standing on. */
+        task_t *previous = current;
+        task_t *victim   = NULL;
+
+        while (previous->next != current) {
+            if (previous->next->state == TASK_DEAD) {
+                victim = previous->next;
+                break;
+            }
+
+            previous = previous->next;
+        }
+
+        if (victim == NULL) {
+            interrupts_restore(were_enabled);
+            return reaped;
+        }
+
+        /* Off the ring before anything is freed. After this the scheduler
+         * cannot reach it and ipc_send cannot find it, so the teardown below
+         * races with nothing. */
+        previous->next = victim->next;
+        task_total--;
+
+        interrupts_restore(were_enabled);
+
+        /* Every present page in that address space is one reference. Dropping
+         * them frees the private ones outright and leaves a shared frame for
+         * whoever else still maps it -- the same walk, either way, because the
+         * count is what decides. */
+        if (victim->cr3 != paging_directory_physical()) {
+            paging_destroy_address_space(victim->cr3);
+        }
+
+        kfree(victim->stack_base);
+        kfree(victim);
+
+        reaped++;
+    }
+}
+
+void task_grant_physical(task_t *task, uint32_t base, uint32_t length)
+{
+    if (task == NULL || length == 0) {
+        return;
+    }
+
+    task->grant_base       = base;
+    task->grant_length     = length;
+    task->may_map_physical = true;
 }
 
 bool tasking_init(void)
@@ -164,130 +196,9 @@ static uint32_t *forge_switch_frame(uint32_t *sp, void (*bootstrap)(void))
     return sp;
 }
 
-task_t *create_task(void (*entry_point)(void))
-{
-    if (current == NULL || entry_point == NULL) {
-        return NULL;
-    }
-
-    task_t *const task = task_alloc();
-
-    if (task == NULL) {
-        return NULL;
-    }
-
-    uint8_t *const stack = kmalloc(TASK_STACK_SIZE);
-
-    if (stack == NULL) {
-        kfree(task);
-        return NULL;
-    }
-
-    /* Stacks grow down, so the frame is built at the high end by
-     * pre-decrementing, which makes the writes appear in reverse of the
-     * layout -- exactly as real pushes would. */
-    uint32_t *sp = (uint32_t *)(void *)(stack + TASK_STACK_SIZE);
-
-    /* Where the task function's own `ret` lands if it ever returns. */
-    *--sp = (uint32_t)(uintptr_t)task_exit;
-
-    /* Three-word iret frame: same privilege level, so no ss:esp pair. */
-    *--sp = TASK_INITIAL_EFLAGS;
-    *--sp = GDT_KERNEL_CODE_SELECTOR;
-    *--sp = (uint32_t)(uintptr_t)entry_point;
-
-    sp = forge_switch_frame(sp, task_bootstrap);
-
-    task->esp              = (uint32_t)(uintptr_t)sp;
-    task->stack_base       = stack;
-    task->kernel_stack_top = (uint32_t)(uintptr_t)(stack + TASK_STACK_SIZE);
-
-    task_link(task);
-
-    return task;
-}
-
-task_t *create_user_task(void (*entry_point)(void))
-{
-    if (current == NULL || entry_point == NULL) {
-        return NULL;
-    }
-
-    if (!user_pages_init()) {
-        kprintf("task: could not map the user sections\n");
-        return NULL;
-    }
-
-    /* Anything outside .utext sits on a supervisor page and would fault on
-     * the very first instruction fetch, so refuse it here with a message
-     * rather than there with a parked task. */
-    const uint32_t entry = (uint32_t)(uintptr_t)entry_point;
-
-    if (entry < (uint32_t)(uintptr_t)__user_text_start ||
-        entry >= (uint32_t)(uintptr_t)__user_text_end) {
-        kprintf("task: entry %p is not in .utext\n", (void *)(uintptr_t)entry);
-        return NULL;
-    }
-
-    task_t *const task = task_alloc();
-
-    if (task == NULL) {
-        return NULL;
-    }
-
-    /* Two stacks. The kernel one is where interrupts and system calls land
-     * (via the TSS), the user one is what ring 3 actually runs on. */
-    uint8_t *const kernel_stack = kmalloc(TASK_STACK_SIZE);
-
-    if (kernel_stack == NULL) {
-        kfree(task);
-        return NULL;
-    }
-
-    void *const user_frame = pmm_alloc_block();
-
-    if (user_frame == NULL) {
-        kfree(kernel_stack);
-        kfree(task);
-        return NULL;
-    }
-
-    const uint32_t user_stack = (uint32_t)(uintptr_t)user_frame;
-
-    if (!map_page(user_stack, user_stack, PAGE_USER | PAGE_WRITABLE)) {
-        pmm_free_block(user_frame);
-        kfree(kernel_stack);
-        kfree(task);
-        return NULL;
-    }
-
-    uint32_t *sp = (uint32_t *)(void *)(kernel_stack + TASK_STACK_SIZE);
-
-    /* Five-word iret frame for a privilege change. The RPL 3 in the CS is
-     * what tells iret to pop the ss:esp pair as well. No task_exit sentinel:
-     * a user function that returns pops from its own stack, and the top of
-     * that page is unmapped, so it faults and is parked. */
-    *--sp = GDT_USER_DATA_SELECTOR_RPL3; /* ss  */
-    *--sp = user_stack + PAGE_SIZE;      /* esp */
-    *--sp = TASK_INITIAL_EFLAGS;         /* IF set, so the timer still preempts ring 3 */
-    *--sp = GDT_USER_CODE_SELECTOR_RPL3; /* cs  */
-    *--sp = entry;                       /* eip */
-
-    sp = forge_switch_frame(sp, task_bootstrap_user);
-
-    task->esp              = (uint32_t)(uintptr_t)sp;
-    task->stack_base       = kernel_stack;
-    task->kernel_stack_top = (uint32_t)(uintptr_t)(kernel_stack + TASK_STACK_SIZE);
-
-    task_link(task);
-
-    return task;
-}
-
 /* Allocates and maps the ring-3 stack of a process, inside its own address
- * space. Unlike the stacks create_user_task hands out -- single frames in
- * identity-mapped low memory, reachable from any task that shares the kernel
- * directory -- these pages exist in exactly one page directory. */
+ * space. Every page a process can reach exists in exactly one page directory,
+ * which is what makes two processes unable to see each other. */
 static bool map_process_stack(uint32_t directory_phys)
 {
     for (uint32_t i = 0; i < USER_STACK_PAGES; i++) {
@@ -333,12 +244,11 @@ task_t *create_user_process(uint32_t entry, uint32_t directory_phys)
         return NULL;
     }
 
-    /* Two stacks again, but this time only one of them is in the kernel's
-     * address space. The kernel stack must be: the CPU switches to it via the
-     * TSS on every trap, including traps taken while this process's CR3 is
-     * loaded, so it has to be mapped in every directory. It is, because it
-     * comes from the heap and the heap's directory entry is shared into each
-     * address space. */
+    /* Two stacks, but only one of them is in the kernel's address space. The
+     * kernel stack must be: the CPU switches to it via the TSS on every trap,
+     * including traps taken while this process's CR3 is loaded, so it has to
+     * be mapped in every directory. It is, because it comes from the heap and
+     * the heap's directory entry is shared into each address space. */
     uint8_t *const kernel_stack = kmalloc(TASK_STACK_SIZE);
 
     if (kernel_stack == NULL) {
@@ -356,9 +266,12 @@ task_t *create_user_process(uint32_t entry, uint32_t directory_phys)
 
     uint32_t *sp = (uint32_t *)(void *)(kernel_stack + TASK_STACK_SIZE);
 
-    /* The same five-word ring-3 frame create_user_task forges. What differs is
-     * only where it points: an entry and a stack that exist in this process's
-     * address space and nowhere else. */
+    /* A five-word iret frame, because the privilege level changes: the RPL 3
+     * in the CS is what tells iret to pop the ss:esp pair as well. It points
+     * at an entry and a stack that exist in this process's address space and
+     * nowhere else. There is no return sentinel -- a user function that
+     * returns pops from its own stack, and the top of that page is unmapped,
+     * so it faults and the process is marked dead. */
     *--sp = GDT_USER_DATA_SELECTOR_RPL3; /* ss  */
     *--sp = USER_STACK_TOP;              /* esp */
     *--sp = TASK_INITIAL_EFLAGS;         /* IF set, so the timer preempts it */

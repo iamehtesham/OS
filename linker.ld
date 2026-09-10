@@ -31,26 +31,6 @@ SECTIONS
         *(.rodata.*)
     }
 
-    /* Code and constants that run in ring 3 get their own page-aligned
-     * sections so they can be mapped user-accessible without exposing the
-     * kernel bytes that would otherwise share the page. Named .utext rather
-     * than .text.user so the .text.* glob above does not swallow them. */
-    .utext BLOCK(4K) : ALIGN(4K)
-    {
-        __user_text_start = .;
-        *(.utext)
-        . = ALIGN(4K);
-        __user_text_end = .;
-    }
-
-    .urodata BLOCK(4K) : ALIGN(4K)
-    {
-        __user_rodata_start = .;
-        *(.urodata)
-        . = ALIGN(4K);
-        __user_rodata_end = .;
-    }
-
     .data BLOCK(4K) : ALIGN(4K)
     {
         *(.data)

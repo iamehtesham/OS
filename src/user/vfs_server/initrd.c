@@ -4,20 +4,33 @@
 
 #include "fs/initrd.h"
 #include "fs/vfs.h"
-#include "mm/kheap.h"
-#include "utils/stdio.h"
-#include "utils/string.h"
+#include "user/ulib.h"
+
+/* The read-only initrd driver, now running at CPL 3 inside the VFS server.
+ *
+ * Two things changed when it left the kernel. There is no kmalloc out here, so
+ * the nodes live in the server's own .bss -- which the ELF loader allocates and
+ * zero-fills, so a fixed array costs nothing until it is touched. And there is
+ * no kprintf, so failures are reported through the print system call. Nothing
+ * else about the driver had to move: it was already reading a flat image out of
+ * memory and answering through a function-pointer table, and that works exactly
+ * the same in ring 3 once the image has been mapped. */
+
+/* A flat image with a fixed node array needs a ceiling. Sized generously
+ * against an initrd that is packed by hand at build time. */
+#define INITRD_MAX_FILES 32u
 
 static const struct initrd_file_header *headers;
 static uint32_t                         file_count;
 static uint32_t                         image_base;
-static fs_node_t                       *root_node;
-static fs_node_t                       *file_nodes;
+static uint32_t                         image_size;
+
+static fs_node_t root_node;
+static fs_node_t file_nodes[INITRD_MAX_FILES];
 
 /* readdir hands back a pointer rather than filling a caller buffer, so the
- * entry lives here. Safe only because the kernel is single-threaded and never
- * re-enters the VFS from an interrupt; a second concurrent reader would see
- * this overwritten. */
+ * entry lives here. Safe only because the server answers one request at a time;
+ * a second concurrent reader would see this overwritten. */
 static struct dirent readdir_entry;
 
 static uint32_t initrd_read(fs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer)
@@ -44,16 +57,14 @@ static uint32_t initrd_read(fs_node_t *node, uint32_t offset, uint32_t size, uin
     const uint8_t *const src =
         (const uint8_t *)(uintptr_t)(image_base + header->offset + offset);
 
-    for (uint32_t i = 0; i < size; i++) {
-        buffer[i] = src[i];
-    }
+    u_memcpy(buffer, src, size);
 
     return size;
 }
 
-/* The image is a fixed read-only blob in RAM; there is nowhere to write. Zero
- * bytes written is the error, which is why callers must check the return value
- * rather than assume success. */
+/* The image is a fixed read-only blob in RAM, and the pages it was mapped into
+ * carry no write permission at all, so there is nowhere to write even if the
+ * driver wanted to. Zero bytes written is the error. */
 static uint32_t initrd_write(fs_node_t *node, uint32_t offset, uint32_t size,
                              const uint8_t *buffer)
 {
@@ -84,7 +95,7 @@ static struct dirent *initrd_readdir(fs_node_t *node, uint32_t index)
         return NULL;
     }
 
-    kstrncpy(readdir_entry.name, file_nodes[index].name, VFS_NAME_MAX);
+    u_strncpy(readdir_entry.name, file_nodes[index].name, VFS_NAME_MAX);
     readdir_entry.inode = index;
 
     return &readdir_entry;
@@ -95,7 +106,7 @@ static fs_node_t *initrd_finddir(fs_node_t *node, const char *name)
     (void)node;
 
     for (uint32_t i = 0; i < file_count; i++) {
-        if (kstrcmp(file_nodes[i].name, name) == 0) {
+        if (u_strcmp(file_nodes[i].name, name) == 0) {
             return &file_nodes[i];
         }
     }
@@ -106,7 +117,7 @@ static fs_node_t *initrd_finddir(fs_node_t *node, const char *name)
 fs_node_t *initrd_init(uint32_t location, uint32_t size)
 {
     if (size < sizeof(struct initrd_superblock)) {
-        kprintf("initrd: image too small (%u B)\n", size);
+        u_print("  [vfs] initrd image is too small\n");
         return NULL;
     }
 
@@ -114,7 +125,7 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size)
         (const struct initrd_superblock *)(uintptr_t)location;
 
     if (super->magic != INITRD_MAGIC) {
-        kprintf("initrd: bad magic 0x%x\n", super->magic);
+        u_print("  [vfs] initrd has bad magic\n");
         return NULL;
     }
 
@@ -124,7 +135,15 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size)
     const uint32_t header_space = size - (uint32_t)sizeof(struct initrd_superblock);
 
     if (super->file_count > header_space / (uint32_t)sizeof(struct initrd_file_header)) {
-        kprintf("initrd: file count %u does not fit the image\n", super->file_count);
+        u_print("  [vfs] initrd file count does not fit the image\n");
+        return NULL;
+    }
+
+    /* The node array is fixed now that there is no heap, so the image has to
+     * fit it. Refusing is the honest answer: mounting the first 32 and
+     * pretending the rest do not exist would make finddir lie. */
+    if (super->file_count > INITRD_MAX_FILES) {
+        u_print("  [vfs] initrd holds more files than the server can mount\n");
         return NULL;
     }
 
@@ -132,17 +151,20 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size)
         location + sizeof(struct initrd_superblock));
     file_count = super->file_count;
     image_base = location;
+    image_size = size;
 
-    /* The image came from the boot loader, so every span it claims is checked
-     * against the image before any of it is dereferenced. */
+    /* The image came from the boot loader by way of a physical mapping the
+     * kernel granted, so every span it claims is still checked against the
+     * image before any of it is dereferenced. Being in ring 3 does not make
+     * the data more trustworthy -- it makes a mistake cheaper. */
     for (uint32_t i = 0; i < file_count; i++) {
         if (headers[i].magic != INITRD_MAGIC) {
-            kprintf("initrd: entry %u has bad magic\n", i);
+            u_print("  [vfs] initrd entry has bad magic\n");
             return NULL;
         }
 
         if (headers[i].offset > size || headers[i].length > size - headers[i].offset) {
-            kprintf("initrd: entry %u runs past the end of the image\n", i);
+            u_print("  [vfs] initrd entry runs past the end of the image\n");
             return NULL;
         }
 
@@ -162,46 +184,24 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size)
         }
 
         if (!terminated) {
-            kprintf("initrd: entry %u has an unterminated name\n", i);
+            u_print("  [vfs] initrd entry has an unterminated name\n");
             return NULL;
         }
     }
 
-    root_node = kmalloc((uint32_t)sizeof(fs_node_t));
-
-    if (root_node == NULL) {
-        kprintf("initrd: could not allocate the root node\n");
-        return NULL;
-    }
-
-    /* One allocation for all the file nodes rather than one each: they share a
-     * lifetime, and a single block costs one header instead of file_count. */
-    file_nodes = NULL;
-
-    if (file_count > 0) {
-        file_nodes = kmalloc(file_count * (uint32_t)sizeof(fs_node_t));
-
-        if (file_nodes == NULL) {
-            kprintf("initrd: could not allocate %u file nodes\n", file_count);
-            kfree(root_node);
-            root_node = NULL;
-            return NULL;
-        }
-    }
-
-    kstrncpy(root_node->name, "/", VFS_NAME_MAX);
-    root_node->flags   = FS_DIRECTORY;
-    root_node->length  = 0;
-    root_node->inode   = 0;
-    root_node->read    = NULL; /* a directory has no byte stream to read */
-    root_node->write   = NULL;
-    root_node->open    = initrd_open;
-    root_node->close   = initrd_close;
-    root_node->readdir = initrd_readdir;
-    root_node->finddir = initrd_finddir;
+    u_strncpy(root_node.name, "/", VFS_NAME_MAX);
+    root_node.flags   = FS_DIRECTORY;
+    root_node.length  = 0;
+    root_node.inode   = 0;
+    root_node.read    = NULL; /* a directory has no byte stream to read */
+    root_node.write   = NULL;
+    root_node.open    = initrd_open;
+    root_node.close   = initrd_close;
+    root_node.readdir = initrd_readdir;
+    root_node.finddir = initrd_finddir;
 
     for (uint32_t i = 0; i < file_count; i++) {
-        kstrncpy(file_nodes[i].name, headers[i].name, VFS_NAME_MAX);
+        u_strncpy(file_nodes[i].name, headers[i].name, VFS_NAME_MAX);
         file_nodes[i].flags  = FS_FILE;
         file_nodes[i].length = headers[i].length;
         file_nodes[i].inode  = i;
@@ -216,10 +216,24 @@ fs_node_t *initrd_init(uint32_t location, uint32_t size)
         file_nodes[i].finddir = NULL;
     }
 
-    return root_node;
+    return &root_node;
 }
 
 uint32_t initrd_file_count(void)
 {
     return file_count;
+}
+
+fs_node_t *initrd_node_by_inode(uint32_t inode)
+{
+    if (inode >= file_count) {
+        return NULL;
+    }
+
+    return &file_nodes[inode];
+}
+
+uint32_t initrd_image_size(void)
+{
+    return image_size;
 }
