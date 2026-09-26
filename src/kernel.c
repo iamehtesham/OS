@@ -9,17 +9,18 @@
 #include "drivers/keyboard.h"
 #include "drivers/vga.h"
 #include "drivers/pit.h"
-#include "ipc/mutex_proto.h"
-#include "ipc/shm_proto.h"
+#include "ipc/input_proto.h"
+#include "ipc/kbd_proto.h"
 #include "ipc/vfs_proto.h"
+#include "ipc/vga_proto.h"
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
 #include "mm/shm.h"
-#include "task/elf.h"
 #include "task/scheduler.h"
 #include "task/task.h"
 #include "multiboot.h"
+#include "utils/klog.h"
 #include "utils/stdio.h"
 #include "utils/string.h"
 
@@ -120,8 +121,7 @@ static void multiboot_for_each_owned_range(const struct multiboot_info *mbi, ran
 static uint32_t memory_init(const struct multiboot_info *mbi)
 {
     if (!(mbi->flags & MULTIBOOT_INFO_MMAP)) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nNo Multiboot memory map -- PMM not initialised.\n");
+        panic("No Multiboot memory map -- PMM not initialised.");
         return 0;
     }
 
@@ -193,7 +193,7 @@ static uint32_t memory_init(const struct multiboot_info *mbi)
      * too or the allocator will hand an initrd out as scratch memory. */
     multiboot_for_each_owned_range(mbi, pmm_reserve_region);
 
-    kprintf("PMM  : %u MiB usable, %u blocks of %u KiB; %u free, %u used\n",
+    klog("PMM  : %u MiB usable, %u blocks of %u KiB; %u free, %u used\n",
             mem_top / (1024u * 1024u), pmm_total_blocks(), PMM_BLOCK_SIZE / 1024u,
             pmm_free_blocks(), pmm_used_blocks());
 
@@ -272,26 +272,46 @@ static void heap_test(void)
         kheap_block_count() == 1 &&
         kheap_largest_free_block() == KHEAP_SIZE - (uint32_t)sizeof(struct kheap_block);
 
-    kprintf("Heap : %u KiB at 0x%x; align=%s reuse=%s coalesce=%s\n",
+    klog("Heap : %u KiB at 0x%x; align=%s reuse=%s coalesce=%s\n",
             kheap_total_bytes() / 1024u, KHEAP_VIRTUAL_BASE,
             aligned ? "ok" : "FAIL", recycled ? "ok" : "FAIL",
             coalesced ? "ok" : "FAIL");
 }
 
 /* The boot loader's modules, in the order the command line named them. This is
- * the kernel's only source of anything: it has no filesystem now, so the two
- * server binaries and the filesystem image all arrive this way. */
-/* How many processes the kernel sizes its reachable memory for. Two are loaded
- * today; the slack costs one page table per 4 MiB of window and nothing else. */
-#define USERLAND_PROCESS_BUDGET 4u
+ * the kernel's only source of anything: it has no filesystem, so the servers,
+ * the shell and the filesystem image all arrive this way. Everything else is
+ * a file inside that image, started by the shell through SYS_SPAWN.
+ *
+ * The four core servers come first so they take pids 1 to 4 -- the well-known
+ * addresses every other program is compiled with -- and the shell is fifth. */
+#define MODULE_VFS_SERVER   0u
+#define MODULE_KBD_SERVER   1u
+#define MODULE_INPUT_SERVER 2u
+#define MODULE_VGA_SERVER   3u
+#define MODULE_SHELL        4u
+#define MODULE_NET_SERVER   5u
+#define MODULE_INITRD       6u
 
-#define MODULE_VFS_SERVER 0u
-#define MODULE_CLIENT     1u
-#define MODULE_SHM_READER 2u
-#define MODULE_SHM_WRITER 3u
-#define MODULE_MUTEX_B    4u
-#define MODULE_MUTEX_A    5u
-#define MODULE_INITRD     6u
+/* The ring-3 driver names the line by its own constant so it need not include
+ * kernel headers; the two must agree or the kernel routes one line and the
+ * driver unmasks another. */
+_Static_assert(KBD_IRQ == IRQ_KEYBOARD, "the keyboard driver and the kernel disagree on the IRQ line");
+
+/* A well-known pid is a contract between the module order above and a constant
+ * some other program was compiled with. Pids are handed out in creation order
+ * after the idle task's 0, so the order here is what makes each constant true
+ * -- and this is the check that says so when it stops being true, which
+ * happens the moment an earlier module fails to load. Tolerates a NULL task so
+ * a failed start reports once, from process_start_module, not twice. */
+static void check_well_known_pid(const task_t *task, uint32_t expected, const char *what)
+{
+    if (task == NULL || task->pid == expected) {
+        return;
+    }
+
+    klog("Warn : %s is pid %u but programs address %u\n", what, task->pid, expected);
+}
 
 /* Returns one Multiboot module's span. */
 static bool multiboot_module(const struct multiboot_info *mbi, uint32_t index,
@@ -324,7 +344,15 @@ extern uint8_t stack_top[];
  * the physical allocator, so the loader reads it where it lies. That is what
  * lets the kernel bootstrap userland with no filesystem of its own: the boot
  * loader hands it the bytes, and everything after the first process is the
- * first process's problem. */
+ * first process's problem. The same process_spawn that SYS_SPAWN uses does
+ * the loading, so a boot module and a program the shell starts pass through
+ * exactly one set of checks.
+ *
+ * Every attempt consumes one pid, success or not. A module that fails to load
+ * must not let the program after it inherit a well-known address: with the
+ * input server's ELF corrupted, the client used to become pid 3 and receive
+ * every keystroke sent to "the input server", and no check said so, because
+ * the check only runs for a task that exists. */
 static task_t *process_start_module(const struct multiboot_info *mbi, uint32_t index,
                                     const char *label)
 {
@@ -332,41 +360,25 @@ static task_t *process_start_module(const struct multiboot_info *mbi, uint32_t i
     uint32_t size;
 
     if (!multiboot_module(mbi, index, &start, &size)) {
-        kprintf("Exec : module %u (%s) was not supplied\n", index, label);
+        klog("Exec : module %u (%s) was not supplied; pid %u left unassigned\n", index, label,
+                task_burn_pid());
         return NULL;
     }
 
-    elf_image_t loaded;
-
-    if (!elf_load((const void *)(uintptr_t)start, size, &loaded)) {
-        kprintf("Exec : %s could not be loaded\n", label);
-        return NULL;
-    }
-
-    task_t *const process = create_user_process(loaded.entry, loaded.directory);
-
-    if (process == NULL) {
-        kprintf("Exec : %s loaded but could not be spawned\n", label);
-        return NULL;
-    }
-
-    kprintf("Exec : %s -> pid %u, %u pages, %u B bss, cr3 %p\n", label, process->pid,
-            loaded.pages, loaded.bss_bytes, (void *)(uintptr_t)loaded.directory);
-
-    return process;
+    return process_spawn((const void *)(uintptr_t)start, size, label);
 }
 
 /* Brings up multitasking and starts userland.
  *
- * This is where the kernel stops. It has no filesystem, no drivers beyond the
- * console and the two chips it needs to schedule, and no idea what a file is.
- * It loads two programs the boot loader handed it, tells one of them where the
- * filesystem image lives, and idles. */
+ * This is where the kernel stops. It has no filesystem, no keyboard driver, no
+ * drivers beyond the console and the two chips it needs to schedule, and no
+ * idea what a file or a keystroke is. It loads the programs the boot loader
+ * handed it, tells one where the filesystem image lives, tells another it may
+ * touch I/O ports and owns IRQ1, and idles. */
 static void userland_start(const struct multiboot_info *mbi)
 {
     if (!tasking_init()) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nTasking failed to initialise.\n");
+        panic("Tasking failed to initialise.");
         return;
     }
 
@@ -382,17 +394,11 @@ static void userland_start(const struct multiboot_info *mbi)
     task_t *const server = process_start_module(mbi, MODULE_VFS_SERVER, "vfs_server.elf");
 
     if (server == NULL) {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nNo VFS server: userland cannot start.\n");
+        panic("No VFS server: userland cannot start.");
         return;
     }
 
-    if (server->pid != VFS_SERVER_PID) {
-        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
-        kprintf("Warn : VFS server is pid %u but clients address %u\n", server->pid,
-                VFS_SERVER_PID);
-        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-    }
+    check_well_known_pid(server, VFS_SERVER_PID, "VFS server");
 
     /* The one privilege that separates the server from any other program: it
      * may map the physical range holding the filesystem image, and nothing
@@ -404,42 +410,77 @@ static void userland_start(const struct multiboot_info *mbi)
 
     if (multiboot_module(mbi, MODULE_INITRD, &initrd_start, &initrd_size)) {
         task_grant_physical(server, initrd_start, initrd_size);
-        kprintf("Grant: pid %u may map phys 0x%x + %u B (the filesystem image)\n",
+        klog("Grant: pid %u may map phys 0x%x + %u B (the filesystem image)\n",
                 server->pid, initrd_start, initrd_size);
     } else {
-        kprintf("Grant: no filesystem image supplied; the server will serve nothing\n");
+        klog("Grant: no filesystem image supplied; the server will serve nothing\n");
     }
 
-    process_start_module(mbi, MODULE_CLIENT, "client.elf");
+    /* The keyboard driver, second. Two privileges, granted here and nowhere
+     * else, while interrupts are still off so the first keystroke cannot beat
+     * the grant.
+     *
+     * The I/O bit lets it raise its own IOPL and so execute in/out from ring
+     * 3. The route makes it the task IRQ1 is forwarded to and the only task
+     * allowed to unmask that line. Both name the task the kernel just created,
+     * not KBD_SERVER_PID: the constant is a contract that is checked, and if
+     * an earlier module failed to load and shifted the pids the keyboard still
+     * works -- the warning below is the only symptom. */
+    task_t *const kbd = process_start_module(mbi, MODULE_KBD_SERVER, "kbd_server.elf");
 
-    /* The reader is started before the writer so it is already blocked in recv
-     * when the offer arrives, and so it takes the pid the writer is compiled to
-     * address. Checked, not assumed -- the same arrangement as the VFS server's
-     * well-known pid, and the same failure if it silently stopped holding. */
-    task_t *const reader = process_start_module(mbi, MODULE_SHM_READER, "shm_reader.elf");
-
-    if (reader != NULL && reader->pid != SHM_READER_PID) {
-        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
-        kprintf("Warn : shm reader is pid %u but the writer addresses %u\n", reader->pid,
-                SHM_READER_PID);
-        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    if (kbd != NULL) {
+        check_well_known_pid(kbd, KBD_SERVER_PID, "keyboard driver");
+        task_grant_io(kbd);
+        irq_route_to_task(IRQ_KEYBOARD, kbd->pid);
+        klog("Grant: pid %u may raise IOPL and owns IRQ%d (the keyboard)\n", kbd->pid,
+                IRQ_KEYBOARD);
+    } else {
+        klog("Grant: no keyboard driver; keystrokes will be dropped by the kernel\n");
     }
 
-    process_start_module(mbi, MODULE_SHM_WRITER, "shm_writer.elf");
+    /* The input server, third. It holds no privilege at all: its authority
+     * over who sees a keystroke comes entirely from being the pid the driver
+     * sends to and applications subscribe with. */
+    check_well_known_pid(process_start_module(mbi, MODULE_INPUT_SERVER, "input_server.elf"),
+                         INPUT_SERVER_PID, "input server");
 
-    /* B before A, so B holds the pid A is compiled to address and is already
-     * blocked in recv when A offers it the page. */
-    task_t *const mutex_b = process_start_module(mbi, MODULE_MUTEX_B, "mutex_b.elf");
+    /* The console, fourth. From here on the screen is its: the kernel keeps a
+     * mapping of the same frame for panic and for nothing else. Two grants --
+     * the text buffer, and I/O so it can move the hardware cursor -- and the
+     * same rule as the driver: they name the task the kernel created, not the
+     * constant. */
+    task_t *const console = process_start_module(mbi, MODULE_VGA_SERVER, "vga_server.elf");
 
-    if (mutex_b != NULL && mutex_b->pid != MUTEX_B_PID) {
-        vga_set_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK);
-        kprintf("Warn : mutex B is pid %u but A addresses %u\n", mutex_b->pid, MUTEX_B_PID);
-        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    if (console != NULL) {
+        check_well_known_pid(console, VGA_SERVER_PID, "console server");
+        task_grant_vga(console);
+        task_grant_io(console);
+        klog("Grant: pid %u may map the VGA text buffer and raise IOPL (the console)\n",
+             console->pid);
+    } else {
+        klog("Grant: no console server; nothing will ever be shown\n");
     }
 
-    process_start_module(mbi, MODULE_MUTEX_A, "mutex_a.elf");
+    /* The shell, fifth. It holds no privilege: it asks the VFS server for a
+     * file, asks the kernel to spawn it, and the kernel decides. Every program
+     * a person runs is a file it starts. */
+    process_start_module(mbi, MODULE_SHELL, "shell.elf");
 
-    kprintf("Sched: PIT %u Hz round robin over %u tasks; the kernel idles\n",
+    /* The network driver, a device driver like the keyboard: I/O access so its
+     * in/out reach the card and the PCI ports, which also gates DMA allocation
+     * and claiming an interrupt line. It finds its own card, allocates its own
+     * DMA buffer and claims the line it discovers -- the kernel grants the
+     * capability, not the specifics, because it cannot know a PCI device's IRQ
+     * before the bus is scanned. Started after the shell, so its pid is beyond
+     * the well-known range and nothing addresses it. */
+    task_t *const net = process_start_module(mbi, MODULE_NET_SERVER, "net_server.elf");
+
+    if (net != NULL) {
+        task_grant_io(net);
+        klog("Grant: pid %u may use I/O, DMA and claim an IRQ (the network driver)\n", net->pid);
+    }
+
+    klog("Sched: PIT %u Hz round robin over %u tasks; the kernel idles\n",
             pit_frequency(), task_count());
 }
 
@@ -447,10 +488,8 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
 {
     vga_init();
 
-    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    kprintf("Hello from the custom OS!\n\n");
+    klog("Hello from the custom OS!\n");
 
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     gdt_init();
 
@@ -459,13 +498,13 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
     tss_init((uint32_t)(uintptr_t)stack_top);
 
     idt_init();
-    kprintf("CPU  : GDT 6 entries (+ring3 code/data, TSS); IDT %d entries\n", IDT_ENTRIES);
+    klog("CPU  : GDT 6 entries (+ring3 code/data, TSS); IDT %d entries\n", IDT_ENTRIES);
 
     /* Must precede sti: until the PIC is remapped its lines still land on
      * vectors 8-15, where a keystroke arrives as a double fault. */
     pic_init();
     keyboard_init();
-    kprintf("IRQ  : PIC remapped to %d-%d; keyboard on IRQ%d (vector %d)\n",
+    klog("IRQ  : PIC remapped to %d-%d; keyboard on IRQ%d (vector %d)\n",
             PIC_MASTER_VECTOR_OFFSET, PIC_SLAVE_VECTOR_OFFSET + 7,
             IRQ_KEYBOARD, IRQ_VECTOR_BASE + IRQ_KEYBOARD);
 
@@ -480,10 +519,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
              * it is about to load. Stating it here rather than hiding it in a
              * constant is what keeps a bigger program from silently running
              * the window out. */
-            paging_init(KHEAP_SIZE + USERLAND_PROCESS_BUDGET * PAGING_PROCESS_RESERVE);
+            paging_init(KHEAP_SIZE + TASK_MAX_PROCESSES * PAGING_PROCESS_RESERVE);
 
             if (paging_is_enabled()) {
-                kprintf("Paging: identity 0x0-0x%x, CR0.PG+WP set, test map %s\n",
+                klog("Paging: identity 0x0-0x%x, CR0.PG+WP set, test map %s\n",
                         paging_identity_limit(), paging_test() ? "ok" : "FAIL");
 
                 if (kheap_init()) {
@@ -491,51 +530,37 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr)
 
                     /* Everything above this line is the kernel. Everything
                      * below it runs in ring 3. */
-                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                     userland_start(mbi);
                 } else {
-                    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-                    kprintf("\nHeap failed to initialise.\n");
+                    panic("Heap failed to initialise.");
                 }
             } else {
-                vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-                kprintf("\nPaging failed to initialise.\n");
+                panic("Paging failed to initialise.");
             }
         }
     } else {
-        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-        kprintf("\nNot entered by a Multiboot loader -- no memory map available.\n");
+        panic("Not entered by a Multiboot loader -- no memory map available.");
     }
 
     __asm__ volatile ("sti");
 
-    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-    kprintf("\nInterrupts on. The filesystem now lives in ring 3:\n\n");
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    /* Logged when the idle task first gets the CPU back, which is after the
+     * timer has already run everything else -- so this line lands wherever the
+     * scheduler puts it, not at the top. */
+    klog("Kernel: interrupts on, idling. Nothing more from ring 0 unless something dies.\n");
 
     /* The kernel thread is the idle task. It never blocks and never dies, so
      * the scheduler always has somewhere to go when every other task is
      * waiting on a message -- which is what makes blocking in recv safe. The
      * scheduler only picks it when nothing else is runnable, so hlt here means
-     * the whole machine genuinely has nothing to do until the next interrupt. */
+     * the whole machine genuinely has nothing to do until the next interrupt.
+     *
+     * It does nothing else. Reaping dead processes used to happen here and
+     * moved to the timer tick (scheduler.c): a program that never blocks
+     * starves this loop forever, and SYS_SPAWN made such a program something
+     * any process can create. Nothing that has to happen may depend on the
+     * machine going idle. */
     for (;;) {
-        /* Reaping happens HERE, and only here, because a process cannot free
-         * the page directory it is executing on -- the directory being torn
-         * down is the one translating the instruction doing the tearing. The
-         * idle task runs on the kernel's own address space and is the one task
-         * guaranteed to exist, so it is the safe place to do it.
-         *
-         * Tearing down an address space drops a reference on every frame it
-         * mapped. Private pages reach zero and are freed; a shared page merely
-         * loses one holder. Collecting afterwards retires any segment whose
-         * last holder has now gone. */
-        if (task_reap_dead() > 0) {
-            const uint32_t retired = shm_collect();
-
-            kprintf("Reap : freed a dead process; %u shm segment(s) retired, %u frames free\n",
-                    retired, pmm_free_blocks());
-        }
-
         __asm__ volatile ("hlt");
     }
 }

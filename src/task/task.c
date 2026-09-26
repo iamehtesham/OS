@@ -3,12 +3,15 @@
 #include <stdint.h>
 
 #include "cpu/gdt.h"
+#include "cpu/irq.h"
 #include "cpu/tss.h"
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
+#include "mm/shm.h"
+#include "task/elf.h"
 #include "task/task.h"
-#include "utils/stdio.h"
+#include "utils/klog.h"
 #include "utils/string.h"
 
 /* Emitted by boot.S. Declared as an array so the symbol's address is the
@@ -69,6 +72,12 @@ static task_t *task_alloc(void)
     task->cr3          = paging_directory_physical();
     task->mailbox_full = false;
     task->can_receive  = true;
+
+    task->trusted_sender_pid   = 0;
+    task->trusted_mailbox_full = false;
+    task->parent_pid           = 0;
+    task->exit_status          = 0;
+    task->wait_target          = 0;
     task->stack_base   = NULL;
     task->esp          = 0;
     task->next         = NULL;
@@ -78,41 +87,201 @@ static task_t *task_alloc(void)
     task->may_map_physical = false;
     task->grant_base       = 0;
     task->grant_length     = 0;
+    task->may_use_io       = false;
+    task->may_map_vga      = false;
+    task->pending_irqs     = 0;
 
     task->shm_next_vaddr = SHM_WINDOW_BASE;
+    task->dma_next_vaddr = DMA_WINDOW_BASE;
 
     return task;
 }
 
-uint32_t task_reserve_shm_vaddr(task_t *task)
+uint32_t task_burn_pid(void)
 {
-    if (task == NULL || task->shm_next_vaddr >= SHM_WINDOW_LIMIT) {
+    return next_pid++;
+}
+
+uint32_t task_reserve_shm_vaddr(task_t *task, uint32_t pages)
+{
+    if (task == NULL || pages == 0 || pages > SHM_MAX_PAGES) {
+        return 0;
+    }
+
+    const uint32_t bytes = pages * PAGE_SIZE;
+
+    if (task->shm_next_vaddr >= SHM_WINDOW_LIMIT ||
+        SHM_WINDOW_LIMIT - task->shm_next_vaddr < bytes) {
         return 0;
     }
 
     const uint32_t reserved = task->shm_next_vaddr;
 
-    task->shm_next_vaddr += PAGE_SIZE;
+    task->shm_next_vaddr += bytes;
 
     return reserved;
 }
 
-uint32_t task_reap_dead(void)
+uint32_t task_reserve_dma_vaddr(task_t *task, uint32_t pages)
 {
-    uint32_t reaped = 0;
+    if (task == NULL || pages == 0) {
+        return 0;
+    }
+
+    const uint32_t bytes = pages * PAGE_SIZE;
+
+    if (task->dma_next_vaddr >= DMA_WINDOW_LIMIT ||
+        DMA_WINDOW_LIMIT - task->dma_next_vaddr < bytes) {
+        return 0;
+    }
+
+    const uint32_t reserved = task->dma_next_vaddr;
+
+    task->dma_next_vaddr += bytes;
+
+    return reserved;
+}
+
+task_t *process_spawn(const void *image, uint32_t size, const char *label)
+{
+    elf_image_t loaded;
+
+    if (!elf_load(image, size, &loaded)) {
+        klog("Exec : %s could not be loaded; pid %u left unassigned\n", label, task_burn_pid());
+        return NULL;
+    }
+
+    task_t *const process = create_user_process(loaded.entry, loaded.directory);
+
+    if (process == NULL) {
+        klog("Exec : %s loaded but could not be spawned\n", label);
+        return NULL;
+    }
+
+    klog("Exec : %s -> pid %u, %u pages, %u B bss, cr3 %p\n", label, process->pid, loaded.pages,
+         loaded.bss_bytes, (void *)(uintptr_t)loaded.directory);
+
+    return process;
+}
+
+void task_zombify(task_t *task, int32_t status)
+{
+    if (task == NULL) {
+        return;
+    }
+
+    task->exit_status = status;
+
+    /* Free the bulk of what it held -- its user pages -- right now. Safe as
+     * the current task: the frames go back to the allocator but nothing reads
+     * user memory afterward, and interrupts are off until the caller yields,
+     * so no other task can be handed one of these frames in the meantime. The
+     * page tables and directory stay until collection so a parent can find
+     * the corpse; the kernel stack stays because the caller is standing on it. */
+    if (task->cr3 != paging_directory_physical()) {
+        paging_release_user_space(task->cr3);
+    }
+
+    task->state = TASK_ZOMBIE;
+
+    /* A dying driver hands its interrupt lines back, so a device left
+     * mid-service is drained and reopened rather than wedged. */
+    irq_release_owner(task->pid);
+
+    /* Wake the parent only if it is waiting for THIS child. A parent waiting
+     * on a different one, or not waiting at all, is left as it is. */
+    task_t *const parent = task_find(task->parent_pid);
+
+    if (parent != NULL && parent->state == TASK_WAITING_CHILD && parent->wait_target == task->pid) {
+        parent->state = TASK_RUNNING;
+    }
+
+    /* Retire any shared segment this task was the last to hold. Its mappings
+     * were just released above, so a segment now down to the registry's own
+     * reference is nobody's and its frames can go back. This has to happen
+     * here, at the exit that drops the reference, rather than only when the
+     * tick reaper collects an orphan: a review found that a parent reaping its
+     * own child through sys_waitpid -- the normal path, the shell does it after
+     * every command -- never reached the reaper's shm_collect, so an ordinary
+     * pair of processes that shared a page leaked its frames and its registry
+     * slot for the life of the machine. Putting it in zombify covers every way
+     * a process ends -- clean exit, fault, orphan -- at the one point the
+     * reference actually falls. */
+    shm_collect();
+}
+
+/* Unlinks `victim` from the ring under a brief interrupts-off window, then
+ * frees its page tables, directory, kernel stack and control block. The leaf
+ * user frames are already gone (freed at zombify). */
+static void collect(task_t *victim)
+{
+    const bool were_enabled = interrupts_disable();
+
+    task_t *previous = current;
+
+    while (previous->next != victim && previous->next != current) {
+        previous = previous->next;
+    }
+
+    if (previous->next != victim) {
+        interrupts_restore(were_enabled); /* not in the ring: already collected */
+        return;
+    }
+
+    previous->next = victim->next;
+    task_total--;
+
+    interrupts_restore(were_enabled);
+
+    if (victim->cr3 != paging_directory_physical()) {
+        paging_free_pagetables(victim->cr3);
+    }
+
+    kfree(victim->stack_base);
+    kfree(victim);
+}
+
+void task_collect_zombie(task_t *task)
+{
+    /* Never the running task, and never anything but a zombie: collecting a
+     * live task would free an address space in use, and collecting the caller
+     * would free the stack it is standing on. */
+    if (task == NULL || task == current || task->state != TASK_ZOMBIE) {
+        return;
+    }
+
+    collect(task);
+}
+
+uint32_t task_reap_orphans(void)
+{
+    uint32_t collected = 0;
 
     for (;;) {
         const bool were_enabled = interrupts_disable();
 
-        /* Walk from the caller, so the caller itself is never a candidate --
-         * which is what keeps this from freeing the stack it is standing on. */
+        /* Walk from the caller, so the caller is never a candidate -- it is
+         * whatever the timer interrupted, and a zombie is never scheduled, so
+         * this is belt-and-suspenders, but it also means `collect` below never
+         * touches the address space this code runs on. */
         task_t *previous = current;
         task_t *victim   = NULL;
 
         while (previous->next != current) {
-            if (previous->next->state == TASK_DEAD) {
-                victim = previous->next;
-                break;
+            task_t *const candidate = previous->next;
+
+            if (candidate->state == TASK_ZOMBIE) {
+                /* Orphan: parent is the kernel (pid 0, which never waits), or a
+                 * task that no longer exists, or itself a zombie about to be
+                 * collected. A live parent in any other state will waitpid it,
+                 * so it is not ours to take. */
+                task_t *const parent =
+                    candidate->parent_pid == 0 ? NULL : task_find(candidate->parent_pid);
+
+                if (parent == NULL || parent->state == TASK_ZOMBIE) {
+                    victim = candidate;
+                    break;
+                }
             }
 
             previous = previous->next;
@@ -120,29 +289,22 @@ uint32_t task_reap_dead(void)
 
         if (victim == NULL) {
             interrupts_restore(were_enabled);
-            return reaped;
+            return collected;
         }
 
-        /* Off the ring before anything is freed. After this the scheduler
-         * cannot reach it and ipc_send cannot find it, so the teardown below
-         * races with nothing. */
         previous->next = victim->next;
         task_total--;
 
         interrupts_restore(were_enabled);
 
-        /* Every present page in that address space is one reference. Dropping
-         * them frees the private ones outright and leaves a shared frame for
-         * whoever else still maps it -- the same walk, either way, because the
-         * count is what decides. */
         if (victim->cr3 != paging_directory_physical()) {
-            paging_destroy_address_space(victim->cr3);
+            paging_free_pagetables(victim->cr3);
         }
 
         kfree(victim->stack_base);
         kfree(victim);
 
-        reaped++;
+        collected++;
     }
 }
 
@@ -157,12 +319,26 @@ void task_grant_physical(task_t *task, uint32_t base, uint32_t length)
     task->may_map_physical = true;
 }
 
+void task_grant_io(task_t *task)
+{
+    if (task != NULL) {
+        task->may_use_io = true;
+    }
+}
+
+void task_grant_vga(task_t *task)
+{
+    if (task != NULL) {
+        task->may_map_vga = true;
+    }
+}
+
 bool tasking_init(void)
 {
     task_t *const kernel_task = task_alloc();
 
     if (kernel_task == NULL) {
-        kprintf("task: could not allocate the kernel task\n");
+        klog("task: could not allocate the kernel task\n");
         return false;
     }
 
@@ -234,13 +410,27 @@ task_t *create_user_process(uint32_t entry, uint32_t directory_phys)
      * and a directory with no task to run it is just leaked frames. */
     if (current == NULL || entry == 0 || directory_phys == 0) {
         paging_destroy_address_space(directory_phys);
+        (void)task_burn_pid();
+        return NULL;
+    }
+
+    /* The cap counts processes, so the idle task is the one not counted. Past
+     * it the identity window was not sized for the frames this process would
+     * take, and a process spawning in a loop must run into something. */
+    if (task_total > TASK_MAX_PROCESSES) {
+        klog("task: %u processes already exist; refusing another\n", task_total - 1u);
+        paging_destroy_address_space(directory_phys);
+        (void)task_burn_pid();
         return NULL;
     }
 
     task_t *const task = task_alloc();
 
+    /* task_alloc consumed the pid on every path below this one, so only the
+     * two failures before it have to burn one by hand. */
     if (task == NULL) {
         paging_destroy_address_space(directory_phys);
+        (void)task_burn_pid();
         return NULL;
     }
 

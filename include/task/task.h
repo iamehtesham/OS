@@ -10,16 +10,30 @@
  * irq_handler frame and its C call chain all live here. */
 #define TASK_STACK_SIZE 8192u
 
+/* How many ring-3 processes may exist at once, the idle task not counted. The
+ * identity window is sized for this many at boot (see paging_init's reserve),
+ * so it is also what keeps a process that spawns in a loop from taking every
+ * frame the kernel can reach. Creation is refused past it. */
+#define TASK_MAX_PROCESSES 16u
+
 /* EFLAGS a new task starts with: bit 1 is reserved and always set, bit 9 is
  * IF. Restoring this via iret is what turns interrupts back on for a task
  * entered from inside the timer handler. */
 #define TASK_INITIAL_EFLAGS 0x202u
 
 typedef enum {
-    TASK_RUNNING, /* eligible to be scheduled */
-    TASK_BLOCKED, /* waiting in ipc_recv for a message; skipped by the scheduler */
-    TASK_DEAD,    /* returned from its entry point; never scheduled again */
+    TASK_RUNNING,       /* eligible to be scheduled */
+    TASK_BLOCKED,       /* waiting in ipc_recv for a message; skipped by the scheduler */
+    TASK_WAITING_CHILD, /* parked in sys_waitpid until wait_target exits; skipped too */
+    TASK_ZOMBIE,        /* exited or faulted: user memory freed, corpse awaiting collection */
 } task_state_t;
+
+/* A zombie's exit_status is the value it passed to sys_exit for a clean exit,
+ * which the shell keeps to 0..255 by convention; a task killed by a fault gets
+ * this base ORed with the trap vector (e.g. 0x10E for a page fault), so a
+ * parent can tell an orderly exit from a crash. The two ranges overlap only if
+ * a program deliberately exits with a status above 255. */
+#define TASK_EXIT_FAULT_BASE 0x100
 
 typedef struct task {
     uint32_t     pid;
@@ -52,6 +66,19 @@ typedef struct task {
     ipc_message_t mailbox;
     bool          mailbox_full;
 
+    /* A second slot, reserved for the one sender this task has named with
+     * SYS_TRUST_SENDER: the device driver a server exists to serve, or the
+     * server an application takes its input from. Ordinary sends contend for
+     * the slot above first come first served, and any process that knows a
+     * well-known pid can keep that slot full from a tight loop -- measured, an
+     * unprivileged flooder aimed at the input server cost every keystroke on
+     * the machine. Nothing it does can touch this slot, and recv drains this
+     * one before the ordinary one. The same idea as pending_irqs, one hop
+     * further from the hardware. */
+    uint32_t      trusted_sender_pid; /* 0: no reservation */
+    ipc_message_t trusted_mailbox;
+    bool          trusted_mailbox_full;
+
     /* False for the kernel idle task, which never calls recv. Without this a
      * send to pid 0 would be accepted, report success, and leave the message
      * parked in the kernel task's mailbox forever. */
@@ -72,12 +99,52 @@ typedef struct task {
     uint32_t grant_base;   /* physical, exactly as the loader reported it */
     uint32_t grant_length; /* bytes; zero means no grant                  */
 
+    /* May this task raise its own IOPL to 3, and so execute in/out from ring 3.
+     *
+     * The same shape as may_map_physical and for the same reason: a bit on a
+     * supervisor page that no system call sets. It is a far broader privilege
+     * than a physical grant, though. IOPL gates every one of the 65536 ports,
+     * not one device, and also cli/sti -- a task holding it can stop preemption
+     * and reprogram the interrupt controller or the timer. So it goes to the
+     * one driver the kernel started for the purpose and to nothing else. */
+    bool may_use_io;
+
+    /* May this task map the VGA text buffer. One page, writable, for the one
+     * process that is the console. Same shape as the two bits above. */
+    bool may_map_vga;
+
+    /* Hardware interrupts forwarded to this task and not yet collected, one bit
+     * per line. Kept apart from the mailbox on purpose: a line is masked from
+     * the moment it is forwarded until the driver re-opens it, so at most one
+     * event per line can be outstanding, and a bit is exactly the right size
+     * for that. It also means no other process can make the driver miss an
+     * interrupt by filling its single message slot. */
+    uint16_t pending_irqs;
+
+    /* The process that created this one with SYS_SPAWN, or 0 for a process
+     * the kernel started at boot. The console puts a child's output where its
+     * parent's goes, and sys_waitpid uses it to enforce that only a parent may
+     * reap its own child -- and the reaper uses it to spot an orphan, whose
+     * parent is gone and who would otherwise never be collected. */
+    uint32_t parent_pid;
+
+    /* Set when this task exits or faults: the status a waiting parent reads. */
+    int32_t exit_status;
+
+    /* While this task is TASK_WAITING_CHILD, the pid it is waiting for. A child
+     * that exits wakes its parent only if the parent's wait_target names it, so
+     * a parent waiting on one child is not woken by a different one exiting. */
+    uint32_t wait_target;
+
     /* Next free page in this process's shared-memory window. A bump allocator:
      * it only ever moves forward, so an address handed out once is never handed
      * out again and an attach can never land on top of a mapping the process is
      * already using. The cost is that detaching reclaims no address space,
      * which is bounded by the window and is the right trade at this size. */
     uint32_t shm_next_vaddr;
+
+    /* The same, for the DMA window: where SYS_ALLOC_DMA maps the next buffer. */
+    uint32_t dma_next_vaddr;
 
     struct task *next; /* circular, so round-robin is just ->next */
 } task_t;
@@ -96,6 +163,14 @@ bool tasking_init(void);
  * left to do with it. */
 task_t *create_user_process(uint32_t entry, uint32_t directory_phys);
 
+/* Consumes a pid without creating a task. Every attempt to start a process
+ * must cost exactly one pid, success or failure: a well-known pid is a
+ * compiled-in address, and if the module that should hold it fails to load,
+ * the next process created would otherwise inherit that address and receive
+ * everything sent to it -- silently, since it is not the process the check at
+ * boot is looking for. Sends to a burned pid fail with IPC_ERR_NO_TASK. */
+uint32_t task_burn_pid(void);
+
 /* Privileges a task to map one physical range, and only that range.
  *
  * Callable only from ring 0, and only with a range the kernel itself learned
@@ -105,20 +180,53 @@ task_t *create_user_process(uint32_t entry, uint32_t directory_phys);
  * never anything outside it. */
 void task_grant_physical(task_t *task, uint32_t base, uint32_t length);
 
-/* Reserves the next page of a task's shared-memory window and returns it, or 0
- * when the window is exhausted. */
-uint32_t task_reserve_shm_vaddr(task_t *task);
+/* Privileges a task to raise its IOPL. Ring 0 only, and only for a task the
+ * kernel has decided is a device driver: with IOPL=3 a process can reach every
+ * I/O port on the machine, so this is not a privilege to hand out on request. */
+void task_grant_io(task_t *task);
 
-/* Unlinks every dead task and releases everything it held: its address space
- * -- which decrements a reference on every frame it had mapped, freeing the
- * private ones and leaving shared ones for their other holders -- then its
- * kernel stack and its control block. Returns how many were reaped.
- *
- * MUST be called from a task that is not itself being reaped, and whose address
- * space is not one being destroyed. The idle task is the one place both are
- * guaranteed: a process cannot free the page directory it is currently
- * executing on, so the work has to happen after something else is running. */
-uint32_t task_reap_dead(void);
+/* Privileges a task to map the VGA text buffer. Ring 0 only, for the console
+ * server: whoever holds this owns the screen. */
+void task_grant_vga(task_t *task);
+
+/* Reserves the next `pages` consecutive pages of a task's shared-memory window
+ * and returns the first, or 0 when the window is exhausted. */
+uint32_t task_reserve_shm_vaddr(task_t *task, uint32_t pages);
+
+/* The same for the DMA window (SYS_ALLOC_DMA). */
+uint32_t task_reserve_dma_vaddr(task_t *task, uint32_t pages);
+
+/* Loads an ELF image from kernel-readable memory and starts it as a ring-3
+ * process, logging the outcome under `label`. The single path by which every
+ * process comes to exist -- boot modules and SYS_SPAWN alike -- so the checks
+ * happen once and identically: elf_load validates the image and builds the
+ * address space, create_user_process gives it a stack and a pid. Every call
+ * consumes one pid, success or failure. Returns NULL and runs nothing if any
+ * check fails. */
+task_t *process_spawn(const void *image, uint32_t size, const char *label);
+
+/* Turns a task into a zombie: records its exit status, frees its user memory
+ * now (paging_release_user_space -- the bulk of what it held), and wakes its
+ * parent if that parent is waiting for exactly this child. Leaves the page
+ * tables, directory, kernel stack and control block for collection, so a
+ * parent can still read the status. Called from sys_exit and from the ring-3
+ * fault path, both of which run as the task itself; freeing its user frames
+ * there is safe because neither reads user memory again before yielding. */
+void task_zombify(task_t *task, int32_t status);
+
+/* Collects one zombie: unlinks it, frees its page tables and directory, its
+ * kernel stack and its control block. MUST NOT be the current task, and its
+ * directory must not be the active CR3 -- both hold, because a parent collects
+ * a child and the reaper collects an orphan, never themselves. */
+void task_collect_zombie(task_t *task);
+
+/* Collects every ORPHAN zombie -- one whose parent is gone (dead, collected,
+ * or the kernel) and so will never call sys_waitpid on it. A zombie whose
+ * parent is still alive is left for that parent to reap. This is the role Unix
+ * gives to init: without it an orphan's corpse would leak forever. Called from
+ * the timer tick, on whichever task was interrupted, which it never collects.
+ * Returns how many were collected. */
+uint32_t task_reap_orphans(void);
 
 task_t  *task_current(void);
 task_t  *task_find(uint32_t pid);

@@ -11,7 +11,8 @@
  * Two things changed when it left the kernel. There is no kmalloc out here, so
  * the nodes live in the server's own .bss -- which the ELF loader allocates and
  * zero-fills, so a fixed array costs nothing until it is touched. And there is
- * no kprintf, so failures are reported through the print system call. Nothing
+ * no kprintf, so failures are reported through u_print, which is a message to
+ * the console server. Nothing
  * else about the driver had to move: it was already reading a flat image out of
  * memory and answering through a function-pointer table, and that works exactly
  * the same in ring 3 once the image has been mapped. */

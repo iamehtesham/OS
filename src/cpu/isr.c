@@ -7,6 +7,7 @@
 #include "sys/syscall.h"
 #include "task/scheduler.h"
 #include "task/task.h"
+#include "utils/klog.h"
 #include "utils/stdio.h"
 
 /* Intel SDM Vol. 3A, Table 6-1. */
@@ -59,7 +60,35 @@ void interrupt_dispatch(struct registers *regs)
     } else if (regs->int_no < IRQ_VECTOR_BASE + IRQ_COUNT) {
         irq_handler(regs);
     } else {
-        kprintf("\n[unexpected interrupt vector %u]\n", regs->int_no);
+        klog("[unexpected interrupt vector %u]\n", regs->int_no);
+    }
+}
+
+/* One report, two destinations. Which one is decided by the caller: a fault in
+ * ring 3 is a diagnostic and goes to the kernel log, which the console server
+ * shows on the system terminal like anything else; a fault in ring 0 is the
+ * end, and goes straight to the screen through the one path the kernel keeps
+ * for that, because nothing above the kernel can be trusted to relay it. */
+typedef int (*report_fn)(const char *fmt, ...);
+
+static void report(report_fn out, const struct registers *regs, const char *name)
+{
+    out("  vector     : %u (%s)\n", regs->int_no, name);
+    out("  error code : 0x%x\n", regs->err_code);
+    out("  eip        : %p\n", (void *)regs->eip);
+    out("  cs:eflags  : 0x%x : 0x%x\n", regs->cs, regs->eflags);
+
+    /* A page fault does not carry the offending address in the frame; the CPU
+     * leaves it in CR2, and the error code describes the access that faulted
+     * rather than being a selector like the other error-code exceptions. */
+    if (regs->int_no == ISR_PAGE_FAULT) {
+        out("  cr2        : %p <- faulting address\n", (void *)paging_fault_address());
+        out("  cause      : %s, %s, %s%s\n",
+            (regs->err_code & PAGE_FAULT_PROTECTION) ? "protection violation"
+                                                     : "page not present",
+            (regs->err_code & PAGE_FAULT_WRITE) ? "write" : "read",
+            (regs->err_code & PAGE_FAULT_USER) ? "user" : "supervisor",
+            (regs->err_code & PAGE_FAULT_FETCH) ? ", instruction fetch" : "");
     }
 }
 
@@ -69,46 +98,28 @@ void isr_handler(struct registers *regs)
                            ? exception_names[regs->int_no]
                            : "Unknown Interrupt";
 
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_RED);
-    kprintf("\n *** CPU EXCEPTION *** \n");
-
-    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
-    kprintf("  vector     : %u (%s)\n", regs->int_no, name);
-    kprintf("  error code : 0x%x\n", regs->err_code);
-    kprintf("  eip        : %p\n", (void *)regs->eip);
-    kprintf("  cs:eflags  : 0x%x : 0x%x\n", regs->cs, regs->eflags);
-
-    /* A page fault does not carry the offending address in the frame; the CPU
-     * leaves it in CR2, and the error code describes the access that faulted
-     * rather than being a selector like the other error-code exceptions. */
-    if (regs->int_no == ISR_PAGE_FAULT) {
-        kprintf("  cr2        : %p <- faulting address\n",
-                (void *)paging_fault_address());
-        kprintf("  cause      : %s, %s, %s%s\n",
-                (regs->err_code & PAGE_FAULT_PROTECTION) ? "protection violation"
-                                                         : "page not present",
-                (regs->err_code & PAGE_FAULT_WRITE) ? "write" : "read",
-                (regs->err_code & PAGE_FAULT_USER) ? "user" : "supervisor",
-                (regs->err_code & PAGE_FAULT_FETCH) ? ", instruction fetch" : "");
-    }
-
-    /* A fault in ring 3 is the user program's problem, not the kernel's. Mark
-     * the task dead and switch away -- halting here would take the PIT, the run
+    /* A fault in ring 3 is the user program's problem, not the kernel's. End
+     * the task and switch away -- halting here would take the PIT, the run
      * queue and every unrelated task down with it, which is a user program
      * being able to stop the whole machine.
      *
-     * Dead, not merely parked: the scheduler skips TASK_DEAD, so no more slices
-     * are spent on the corpse, and ipc_send refuses it, so a sender learns the
-     * receiver is gone instead of getting IPC_OK for a message that lands in a
-     * mailbox nobody will ever read. This frame stays on the task's own kernel
-     * stack, which is never resumed. schedule() always has the idle task to go
-     * to; the loop below is only a safety net if it ever returns. */
+     * It ends exactly as sys_exit ends it: task_zombify frees its user memory,
+     * hands back any interrupt lines it owned, and wakes a parent waiting on it
+     * -- which is the point of doing it here rather than merely parking the
+     * task. A shell that called sys_waitpid on this child would otherwise block
+     * forever on a corpse that never reported. The status carries the trap
+     * vector so the parent can tell a crash from a clean exit. The scheduler
+     * skips a zombie and ipc_send refuses it; the loop below is a safety net
+     * for the case schedule() somehow returns to it. */
     if (registers_from_user(regs)) {
+        klog("*** CPU EXCEPTION in ring 3 ***\n");
+        report(klog, regs, name);
+
         task_t *const self = task_current();
 
         if (self != NULL) {
-            self->state = TASK_DEAD;
-            kprintf("  user task pid %u marked dead; the kernel keeps running.\n", self->pid);
+            klog("  user task pid %u killed by fault; the kernel keeps running.\n", self->pid);
+            task_zombify(self, (int32_t)(TASK_EXIT_FAULT_BASE + regs->int_no));
             schedule();
         }
 
@@ -117,11 +128,16 @@ void isr_handler(struct registers *regs)
         }
     }
 
-    kprintf("  halted.\n");
-
     /* A ring-0 fault is different: there is no smaller unit to sacrifice and
-     * nothing left that can be trusted to keep running. Mask interrupts and
-     * stop; the jump back into hlt catches an NMI waking us up. */
+     * nothing left that can be trusted to keep running -- not even the console
+     * server, so this is the one report that goes to the screen directly. Mask
+     * interrupts and stop; the jump back into hlt catches an NMI waking us. */
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_RED);
+    panic_print("\n *** CPU EXCEPTION *** \n");
+    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+    report(panic_print, regs, name);
+    panic_print("  halted.\n");
+
     for (;;) {
         __asm__ volatile ("cli; hlt");
     }

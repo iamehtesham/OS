@@ -77,11 +77,22 @@
 #define USER_MAP_BASE  0x50000000u
 #define USER_MAP_LIMIT 0x60000000u
 
+/* The last page of that window is where SYS_MAP_HW_BUFFER puts the VGA text
+ * buffer. A module grant grows upward from USER_MAP_BASE and the console server
+ * holds no module grant, so the two never meet. */
+#define USER_HW_BASE (USER_MAP_LIMIT - PAGE_SIZE)
+
 /* Where shared segments land in a process. Its own window, disjoint from the
  * image, the stack and the physical-map window, so a bump allocator over it
  * cannot collide with anything the process already owns. */
 #define SHM_WINDOW_BASE  0xA0000000u
 #define SHM_WINDOW_LIMIT 0xB0000000u
+
+/* Where SYS_ALLOC_DMA maps a driver's contiguous DMA buffer. Its own window so
+ * a driver's device memory never lands on top of a shared segment or a mapped
+ * module. Like the shm window, handed out by a per-task bump pointer. */
+#define DMA_WINDOW_BASE  0x70000000u
+#define DMA_WINDOW_LIMIT 0x80000000u
 
 /* Builds the page directory, identity-maps low memory and turns on the MMU.
  *
@@ -137,6 +148,25 @@ uint32_t paging_create_address_space(void);
  * that the kernel does not also own, then the directory itself. Never touches
  * a table shared with the kernel directory, and refuses the kernel's own. */
 void paging_destroy_address_space(uint32_t directory_phys);
+
+/* The two halves of paging_destroy_address_space, for a process that dies in
+ * two steps: it frees its own user memory as it exits, and its page tables and
+ * directory are freed later by whoever collects the corpse.
+ *
+ * paging_release_user_space frees only the leaf frames mapped through the
+ * process's OWN (non-kernel) page tables -- the ELF image, the ring-3 stack,
+ * shared segments -- decrementing each frame's reference count and clearing the
+ * PTE so it cannot be freed twice. It leaves the page tables and the directory
+ * intact. It is safe to call while running as the task being freed and on its
+ * own CR3: it returns frames to the allocator but reads no user memory
+ * afterward, and the caller runs with interrupts off until it switches away, so
+ * no other task can be handed a freed frame in the meantime.
+ *
+ * paging_free_pagetables frees the process's own page-table frames and the
+ * directory frame, and nothing else -- the leaf frames are already gone. It
+ * must run off the task, on another CR3, since it frees the directory. */
+void paging_release_user_space(uint32_t directory_phys);
+void paging_free_pagetables(uint32_t directory_phys);
 
 /* map_page, but into an arbitrary address space rather than the kernel's. */
 bool paging_map_in(uint32_t directory_phys, uint32_t physical_addr,

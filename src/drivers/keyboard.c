@@ -1,56 +1,56 @@
+#include <stddef.h>
 #include <stdint.h>
 
 #include "arch/io.h"
+#include "arch/ps2.h"
 #include "cpu/irq.h"
 #include "cpu/isr.h"
 #include "drivers/keyboard.h"
-#include "utils/stdio.h"
+#include "task/scheduler.h"
+#include "task/task.h"
+#include "utils/klog.h"
 
-/* Scancodes arrive one byte at a time; bit 7 distinguishes the two halves of a
- * keystroke, so the table only needs to cover the low 128 values. */
-#define SCANCODE_TABLE_SIZE 128
+static uint32_t dropped;
 
-/* Bit 7 set marks a break code -- the release half of a keystroke. */
-#define SCANCODE_BREAK_MASK 0x80
-
-/* US QWERTY, scancode set 1, unshifted. Entries left at 0 are keys this driver
- * does not translate: modifiers, function keys, the keypad, and Escape.
- * Everything from 0x40 up zero-fills.
+/* IRQ1. The kernel does not read the scancode here; it does not know what one
+ * means any more. It hands the event to the driver that owns the line and gets
+ * out of the way.
  *
- * Set 1 is what the PS/2 controller produces by default, because it translates
- * the keyboard's native set 2 back into the original XT codes. */
-static const char scancode_to_ascii[SCANCODE_TABLE_SIZE] = {
-    /* 0x00 */ 0,    0,    '1',  '2',  '3',  '4',  '5',  '6',
-    /* 0x08 */ '7',  '8',  '9',  '0',  '-',  '=',  '\b', '\t',
-    /* 0x10 */ 'q',  'w',  'e',  'r',  't',  'y',  'u',  'i',
-    /* 0x18 */ 'o',  'p',  '[',  ']',  '\n', 0,    'a',  's',
-    /* 0x20 */ 'd',  'f',  'g',  'h',  'j',  'k',  'l',  ';',
-    /* 0x28 */ '\'', '`',  0,    '\\', 'z',  'x',  'c',  'v',
-    /* 0x30 */ 'b',  'n',  'm',  ',',  '.',  '/',  0,    '*',
-    /* 0x38 */ 0,    ' ',  0,    0,    0,    0,    0,    0,
-};
-
+ * Also invoked with regs == NULL by irq_release_owner when the driver has just
+ * died, to drain whatever it left in the controller. */
 static void keyboard_callback(struct registers *regs)
 {
     (void)regs;
 
-    /* The byte must be read even if it is discarded below: the controller holds
-     * the line asserted until its output buffer is drained, so skipping the
-     * read would wedge the keyboard after one keystroke. */
-    const uint8_t scancode = inb(PS2_DATA_PORT);
+    task_t *const driver = irq_forward_to_owner(IRQ_KEYBOARD);
 
-    /* Only make codes are handled for now. This also swallows the 0xE0 prefix
-     * that introduces extended keys such as the arrows, so their second byte
-     * arrives as a separate unprefixed scancode -- harmless here because every
-     * extended code lands on a 0 entry in the table. */
-    if (scancode & SCANCODE_BREAK_MASK) {
+    if (driver != NULL) {
+        /* The line is now masked and the scancode is still sitting in the
+         * controller, waiting for the driver's inb. Run the driver now rather
+         * than at its next turn: it is a keystroke, and a key that echoes a
+         * tick late is a key that feels broken. The interrupted task keeps its
+         * place in the ring. */
+        schedule_to(driver);
         return;
     }
 
-    const char c = scancode_to_ascii[scancode];
+    /* No driver, or a dead one. Whatever is in the controller MUST still be
+     * read: the 8042 holds the line asserted while its output buffer is full,
+     * the 8259 is edge triggered, and a line that never falls never rises
+     * again. Skipping this read would silence the keyboard until reboot.
+     *
+     * Gated on the status bit and bounded, for two reasons that are both about
+     * this not being a plain interrupt handler any more. It also runs out of
+     * band from irq_release_owner, where nothing guarantees a byte is waiting
+     * -- a review caught it reporting the controller's stale 0xFA acknowledge
+     * as a dropped keystroke when the driver died before touching the port.
+     * And a driver that dies mid-service can leave more than one byte queued
+     * behind the one it was reading. */
+    for (int i = 0; i < 16 && (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL); i++) {
+        const uint8_t scancode = inb(PS2_DATA_PORT);
 
-    if (c != 0) {
-        kprintf("%c", c);
+        dropped++;
+        klog("[kbd: no ring-3 driver owns IRQ1; scancode 0x%x dropped]\n", scancode);
     }
 }
 
@@ -60,9 +60,10 @@ void keyboard_init(void)
      * The 8042 holds IRQ1 asserted for as long as a byte sits in its output
      * buffer, and pic_remap's ICW1 has just reset the 8259's edge-sense
      * circuit -- a line that is already high never produces the fresh
-     * low-to-high transition an interrupt needs. Since keyboard_callback is the
-     * only code that reads the data port, an undrained byte would deadlock the
-     * keyboard permanently: no interrupt, so no read, so no edge, forever.
+     * low-to-high transition an interrupt needs. Nothing reads the data port
+     * again until the ring-3 driver is told to, and it is only told on an
+     * interrupt, so an undrained byte would deadlock the keyboard permanently:
+     * no interrupt, so no read, so no edge, forever.
      *
      * The count is bounded so a wedged controller cannot hang the boot. */
     for (int i = 0; i < 16 && (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL); i++) {
@@ -70,4 +71,9 @@ void keyboard_init(void)
     }
 
     irq_install_handler(IRQ_KEYBOARD, keyboard_callback);
+}
+
+uint32_t keyboard_dropped(void)
+{
+    return dropped;
 }

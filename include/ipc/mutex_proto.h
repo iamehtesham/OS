@@ -15,9 +15,10 @@
  * itself -- a lock in either process's private memory would be two locks, each
  * of which always looks free to its owner. */
 
-/* Fixed by creation order. B is started first so it is already blocked in recv
- * when A offers it the segment. */
-#define MUTEX_B_PID 5u
+/* Fixed by creation order: after the four core servers, the client and the two
+ * shared-memory programs. B is started before A so it is already blocked in
+ * recv when A offers it the segment. */
+#define MUTEX_B_PID 8u
 
 #define MSG_MUTEX_OFFER 30u /* A -> B: data = { u32 shm id }              */
 #define MSG_MUTEX_SYNC  31u /* rendezvous, so both phases actually contend */

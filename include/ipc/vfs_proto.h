@@ -25,12 +25,30 @@
 #define MSG_READ_REPLY   14u /* data = { u8 count, bytes... }                */
 #define MSG_READ_FAIL    15u /* data = { u32 reason }                        */
 
+/* Loading a whole file into a shared segment, for SYS_SPAWN. The client
+ * creates the segment, names this server as the peer, and sends the id: the
+ * server attaches, copies the file to the start of the segment, and replies
+ * with how many bytes it wrote. The kernel enforces entitlement on the attach,
+ * so a client cannot have the server write into a segment it does not own, and
+ * the server takes the segment's size from the kernel, never from the client,
+ * so a client cannot have it write past the end. */
+#define MSG_LOAD       16u /* data = { u32 inode, u32 shm id }              */
+#define MSG_LOAD_REPLY 17u /* data = { u32 bytes copied }                   */
+#define MSG_LOAD_FAIL  18u /* data = { u32 reason }                         */
+
+/* Directory listing, one entry per round trip. */
+#define MSG_LIST       19u /* data = { u32 index }                          */
+#define MSG_LIST_REPLY 20u /* data = name, NUL terminated (truncated to fit) */
+#define MSG_LIST_END   21u /* no such index: the listing is over            */
+
 /* Why an open failed. Carried as a word so a client can report the difference
  * between "no such file" and "you asked me something I cannot parse". */
 #define VFS_ERR_NOT_FOUND  1u
 #define VFS_ERR_BAD_NAME   2u
 #define VFS_ERR_NOT_MOUNTED 3u
 #define VFS_ERR_BAD_REQUEST 4u
+#define VFS_ERR_NO_ACCESS   5u /* the segment could not be attached           */
+#define VFS_ERR_TOO_BIG     6u /* the file does not fit the segment           */
 
 /* A filename has to fit the payload with room for its terminator. Shorter than
  * the VFS's own name field, so the server refuses a request it could not have

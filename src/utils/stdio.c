@@ -42,15 +42,15 @@ static size_t kutoa(uint32_t value, uint32_t base, bool uppercase, char *out)
     return len;
 }
 
-int kvprintf(const char *fmt, va_list args)
+int kvformat(kformat_sink sink, void *context, const char *fmt, va_list args)
 {
     char numbuf[NUMBUF_SIZE];
     int written = 0;
 
     while (*fmt != '\0') {
         if (*fmt != '%') {
-            /* Emit the whole run of literal text in one call so the hardware
-             * cursor is reprogrammed once rather than per character. */
+            /* Hand over the whole run of literal text in one call: a sink that
+             * reprograms a hardware cursor does so once per run, not per byte. */
             const char *start = fmt;
 
             while (*fmt != '\0' && *fmt != '%') {
@@ -59,7 +59,7 @@ int kvprintf(const char *fmt, va_list args)
 
             const size_t run = (size_t)(fmt - start);
 
-            vga_write(start, run);
+            sink(context, start, run);
             written += (int)run;
             continue;
         }
@@ -70,12 +70,12 @@ int kvprintf(const char *fmt, va_list args)
         case '\0':
             /* Truncated specifier at the end of the format string: show the
              * stray '%' rather than reading past the terminator. */
-            vga_write("%", 1);
+            sink(context, "%", 1);
             written++;
             continue;
 
         case '%':
-            vga_write("%", 1);
+            sink(context, "%", 1);
             written++;
             break;
 
@@ -83,7 +83,7 @@ int kvprintf(const char *fmt, va_list args)
             /* Default argument promotion widens char to int in varargs. */
             const char c = (char)va_arg(args, int);
 
-            vga_write(&c, 1);
+            sink(context, &c, 1);
             written++;
             break;
         }
@@ -97,7 +97,7 @@ int kvprintf(const char *fmt, va_list args)
 
             const size_t len = kstrlen(str);
 
-            vga_write(str, len);
+            sink(context, str, len);
             written += (int)len;
             break;
         }
@@ -111,7 +111,7 @@ int kvprintf(const char *fmt, va_list args)
                 /* Negating INT32_MIN overflows, so take the magnitude in
                  * unsigned arithmetic, where the wraparound is defined. */
                 magnitude = (uint32_t)0 - (uint32_t)value;
-                vga_write("-", 1);
+                sink(context, "-", 1);
                 written++;
             } else {
                 magnitude = (uint32_t)value;
@@ -119,7 +119,7 @@ int kvprintf(const char *fmt, va_list args)
 
             const size_t len = kutoa(magnitude, 10, false, numbuf);
 
-            vga_write(numbuf, len);
+            sink(context, numbuf, len);
             written += (int)len;
             break;
         }
@@ -127,7 +127,7 @@ int kvprintf(const char *fmt, va_list args)
         case 'u': {
             const size_t len = kutoa(va_arg(args, unsigned int), 10, false, numbuf);
 
-            vga_write(numbuf, len);
+            sink(context, numbuf, len);
             written += (int)len;
             break;
         }
@@ -137,7 +137,7 @@ int kvprintf(const char *fmt, va_list args)
             const size_t len =
                 kutoa(va_arg(args, unsigned int), 16, *fmt == 'X', numbuf);
 
-            vga_write(numbuf, len);
+            sink(context, numbuf, len);
             written += (int)len;
             break;
         }
@@ -148,17 +148,17 @@ int kvprintf(const char *fmt, va_list args)
             const uintptr_t value = (uintptr_t)va_arg(args, void *);
             const size_t len = kutoa((uint32_t)value, 16, false, numbuf);
 
-            vga_write("0x", 2);
-            vga_write(numbuf, len);
+            sink(context, "0x", 2);
+            sink(context, numbuf, len);
             written += 2 + (int)len;
             break;
         }
 
         default:
             /* Unknown conversion: echo it verbatim so a broken format string is
-             * visible on screen instead of silently swallowing its argument. */
-            vga_write("%", 1);
-            vga_write(fmt, 1);
+             * visible instead of silently swallowing its argument. */
+            sink(context, "%", 1);
+            sink(context, fmt, 1);
             written += 2;
             break;
         }
@@ -169,14 +169,42 @@ int kvprintf(const char *fmt, va_list args)
     return written;
 }
 
-int kprintf(const char *fmt, ...)
+static void screen_sink(void *context, const char *data, size_t length)
+{
+    (void)context;
+    vga_write(data, length);
+}
+
+int panic_print(const char *fmt, ...)
 {
     va_list args;
     int written;
 
     va_start(args, fmt);
-    written = kvprintf(fmt, args);
+    written = kvformat(screen_sink, NULL, fmt, args);
     va_end(args);
 
     return written;
+}
+
+void panic(const char *fmt, ...)
+{
+    va_list args;
+
+    __asm__ volatile ("cli");
+
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_RED);
+    vga_write("\n *** KERNEL PANIC *** \n", 24);
+    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+
+    va_start(args, fmt);
+    (void)kvformat(screen_sink, NULL, fmt, args);
+    va_end(args);
+
+    vga_write("\n  halted.\n", 11);
+
+    /* The jump back into hlt catches an NMI waking the CPU. */
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
 }

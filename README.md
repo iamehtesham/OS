@@ -7,11 +7,30 @@ memory with two-level paging, has a kernel heap, preempts processes round-robin
 on the PIT, loads ELF executables into address spaces of their own, and passes
 synchronous messages between them.
 
-**The filesystem is not in it.** The VFS and the initrd driver are an ordinary
-ring-3 ELF binary that answers IPC requests, in an address space with no more
-access to the kernel than any other program. The kernel does not know what a
-file is: it starts the programs the boot loader handed it, tells one of them
-which physical range holds the filesystem image, and idles.
+**The filesystem is not in it, and neither is the keyboard driver.** The VFS
+and the initrd driver are an ordinary ring-3 ELF binary that answers IPC
+requests, in an address space with no more access to the kernel than any other
+program. The keyboard driver is another: the kernel takes IRQ1, masks it, and
+forwards it as a message; the driver reads the scancode from port `0x60` itself,
+under an IOPL the kernel raised for it, and re-opens the line when it is done.
+The kernel does not know what a file or a keystroke is: it starts the programs
+the boot loader handed it, tells one of them which physical range holds the
+filesystem image, tells another it may touch I/O ports and owns a line, and
+idles. A third server, with no privilege at all, decides which application each
+keystroke reaches. And the console is not in the kernel either: the kernel does
+not print, it logs, and a fourth server that maps the VGA text buffer shows that
+log and every process's output on virtual terminals it keeps in its own memory.
+The kernel writes to the screen for exactly one reason, a panic. And the last
+of its servers drives an RTL8139 network card from ring 3 — finding it on the
+PCI bus, allocating a DMA buffer, reading packets the card writes straight into
+memory, naming the Ethernet addresses and protocol inside each one,
+answering ARP for its own address, answering a ping — an ICMP echo request,
+checksums verified coming in and computed going out — and echoing UDP sent to
+port 7, whose checksum covers a pseudo-header of IP fields as well as the
+datagram, with the kernel never learning what a packet is. The kernel
+starts six processes at boot and no more; a shell among them starts everything
+else from files in the filesystem image with `sys_spawn`, and the kernel
+validates every image before a byte of it runs.
 
 Everything here is freestanding — no libc, no libgcc, no runtime.
 
@@ -20,6 +39,11 @@ Everything here is freestanding — no libc, no libgcc, no runtime.
 ```
 gcc (with -m32 / multilib)   binutils (as, ld)   qemu-system-i386   make
 ```
+
+The network test targets also need `python3` (the tools under `tools/`) and
+`tcpdump` (`make ping`, `make udp` and `make udp-host` re-check every checksum
+the guest sent with it; reading a capture needs no privilege). `make udp-host`
+and the `nc` step below need OpenBSD `netcat`, for its `-W` option.
 
 There is deliberately no `i686-elf` cross-compiler in the loop: the host GCC is
 used purely as a 32-bit code generator, and linking goes through `ld` directly so
@@ -33,6 +57,10 @@ GNU as (AT&T syntax) in `.S` files rather than NASM.
 ```sh
 make build      # compile and link -> build/kernel.bin
 make qemu       # boot it in QEMU
+make netdemo    # boot it and feed the network card real Ethernet frames
+make ping       # boot it headless, ping it, and check every reply byte
+make udp        # boot it headless, send UDP to port 7, and check every echo
+make udp-host   # the host's own nc through QEMU's user network and a forward
 make check      # validate the Multiboot 1 header with grub-file
 make screenshot # headless boot, dump the framebuffer to build/screen.ppm
 make clean
@@ -41,31 +69,98 @@ make clean
 QEMU implements the Multiboot loader itself, so `make qemu` boots the ELF
 directly — no GRUB, no ISO, no disk image is involved.
 
+`make qemu` attaches the network card to QEMU's user-mode network. The driver
+opens with an ARP request for the gateway and QEMU's stack answers it — press
+Esc and the console shows the request going out and the reply coming back. It
+also forwards UDP from the host to the guest's echo service, so while it runs,
+in another terminal:
+
+```bash
+nc -u 127.0.0.1 7007
+```
+
+Type a line and it comes back; press Esc in the QEMU window to watch it arrive
+(`UDP Packet | Port 53691 -> 7 | Length: 14`, then the text). Ctrl-C ends `nc`;
+Ctrl-D does not. Not `nc -u 10.0.2.15 7`: user-mode networking is NAT, the host
+routes 10.0.2.15 out through its own LAN router, and host port 7 needs
+privilege — so QEMU forwards `127.0.0.1:7007` to `10.0.2.15:7`, bound to
+loopback so nothing else on the LAN can reach it. Use `127.0.0.1` rather than
+`localhost`, which may resolve to `::1`; leave out `-v`, which makes OpenBSD
+`nc` send probe datagrams first; and keep lines under 1472 bytes, beyond which
+the forward fragments them and the guest drops fragments. If port 7007 is taken
+QEMU will not start: `make qemu UDP_ECHO_HOST_PORT=<other port>`.
+
+That gateway never sends an ARP request or a ping, though, and nothing
+malformed, and those reply paths need a peer that does. `make netdemo` boots
+the same machine with the card on a socket netdev instead, writes ARP, an ICMP
+echo request, a UDP echo, IPv4, IPv6 and unrecognised frames into it
+(`tools/inject_frames.py`), and reads back and decodes whatever the guest
+transmits — so each reply is checked as bytes on the wire rather than as a line
+on the guest's own console.
+
+`make ping` is how the machine is pinged, and it is not the host's own `ping`,
+which cannot reach it: user-mode networking is NAT, its `hostfwd` forwards TCP
+and UDP but never ICMP, and the TAP device that would let the host route to
+10.0.2.15 needs root. So `tools/ping.py` plays the host. It builds real ICMP
+echo requests, delivers them to the card over a socket netdev, and checks every
+reply field by field against checksums from its own RFC 1071 implementation.
+Then it sends requests the guest must refuse — bad checksums, other addresses,
+broadcast and multicast sources, fragments, malformed and oversized headers,
+non-echo ICMP — and after each one proves the guest is still answering. QEMU records every frame the guest transmits into `build/ping.pcap`, and
+`tcpdump`, a decoder this project did not write, re-checks every checksum in
+it. The target is headless
+and its exit status is the verdict.
+
+`make udp` does the same for the echo service (`tools/udp_echo.py`): datagrams
+of 0 to 1472 bytes and every byte value, requests with and without a checksum,
+the one whose checksum comes out as zero, and then everything the guest must
+refuse — bad checksums, checksums over a wrong pseudo-header, lengths shorter
+than the header or longer than the datagram, other ports, service source ports
+— each built so that only the check it is named for can stop it. It also reads
+the guest's console out of VGA memory through the QEMU monitor. Its `tcpdump`
+gate is stricter than ping's, because a UDP checksum of 0 is legal and means
+"none": every UDP frame the guest sent must read `udp sum ok`. `make udp-host`
+is the `nc` step above, headless: the host's own netcat through QEMU's
+user-mode network and a port forward of its own (7008), the guest's console
+checked for the datagram arriving, and a size sweep.
+
 ## What it does
 
 | Subsystem | Notes |
 | --- | --- |
 | **Boot** | Multiboot 1 header, loaded at 1 MiB, 16 KiB stack |
-| **VGA console** | 80×25 text, 16 colours, hardware cursor via CRTC ports, scrolling, deferred line wrap, `\n` `\r` `\t` `\b` |
-| **`kprintf`** | `%c %s %d %i %u %x %X %p %%`, with its own integer conversion — all 32-bit, so no libgcc division helper is ever referenced |
+| **Formatter** | `%c %s %d %i %u %x %X %p %%` into a pluggable sink — the log or the screen — with its own 32-bit integer conversion, so no libgcc helper is ever referenced |
 | **GDT** | 6 flat entries: null, ring-0 code/data (`0x08`/`0x10`), ring-3 code/data (`0x18`/`0x20`, DPL 3), and a TSS (`0x28`) |
 | **IDT** | 256 gates; vectors 0–31 exceptions, 32–47 IRQs, `0x80` system calls (the only DPL-3 gate); one shared entry stub |
 | **Exceptions** | All 32 vectors named and reported, with error code, EIP, and CR2 + decoded cause for page faults |
 | **PIC** | Both 8259s remapped off vectors 8–15, per-line masking, central EOI sent before dispatch |
-| **Keyboard** | PS/2 IRQ1, scancode set 1 → ASCII, make codes only |
 | **Physical memory** | Bitmap allocator over 4 KiB frames, driven by the Multiboot memory map, with a reference count per frame so one frame can be mapped into several address spaces and is freed only by its last holder |
 | **Paging** | Two-level page tables, identity-mapped low memory, `CR0.PG` + `CR0.WP`, and per-process address spaces that share the kernel's tables without sharing its user bit |
 | **Kernel heap** | `kmalloc`/`kfree` over a 1 MiB region at `0xC0000000`: linked list of blocks, first fit, splitting, and coalescing in both directions |
 | **Multitasking** | Preemptive round robin on a 100 Hz PIT, with an assembly context switch and forged first-run frames; the kernel thread is the idle task and runs only when nothing else can |
 | **Ring 3** | User-mode segments, a TSS supplying `ss0:esp0`, and system calls through an `int 0x80` gate at DPL 3; a fault in ring 3 kills only that task |
-| **IPC** | Synchronous message passing between ring-3 tasks: single-slot mailboxes in the TCB, a blocking `recv` that parks the task, and a scheduler that skips blocked tasks |
+| **IPC** | Synchronous message passing between ring-3 tasks: single-slot mailboxes in the TCB, a blocking `recv` that parks the task, and a scheduler that skips blocked tasks. A task may reserve a second slot for the one sender it trusts, so a driver's messages cannot be crowded out by a process flooding the ordinary slot |
 | **ELF loader** | Reads an `ET_EXEC` i386 binary straight out of a Multiboot module, maps each `PT_LOAD` segment into a fresh address space with `.bss` allocated and zero-filled, and spawns it as a ring-3 process |
 | **Physical grants** | `sys_map_physical` lets a task map physical memory, gated on a kernel-set capability bit *and* a specific range recorded from the boot loader's module list. Every other process is refused |
 | **VFS server** (ring 3) | The `fs_node` dispatch table and the read-only initrd driver, running as an unprivileged process. Answers `MSG_OPEN` and `MSG_READ` over IPC |
 | **Client** (ring 3) | A second process with no filesystem code and no grant. It opens and reads a file entirely by asking the server |
-| **Shared memory** | `sys_shm_map` creates a page and returns an id plus an address; `sys_shm_attach` maps the same frame into another process at an address of the kernel's choosing. Only the id crosses between processes |
+| **Shared memory** | `sys_shm_map` creates a segment of one to sixteen pages and returns an id, an address and the size; `sys_shm_attach` maps the same frames, contiguously, into another process at an address of the kernel's choosing. Only the id crosses between processes, and only the creator and the one peer it named may attach |
+| **Reaping** | `sys_waitpid` collects a process's own children. The timer tick collects orphans — a zombie whose parent has died — which is the role Unix gives to `init`. Either way tearing down an address space drops a reference on every frame it mapped: private pages are freed, shared pages lose one holder, reserved memory is pinned and never freed |
 | **Ring-3 mutex** | `lock cmpxchg` in user assembly, with the lock word living *inside* the shared frame so both processes contend on one physical word. A failed acquisition yields instead of spinning |
-| **Reaping** | The idle task tears down dead processes, which drops a reference on every frame they mapped. Private pages are freed, shared pages lose one holder, and reserved memory is pinned so it can never be freed at all |
+| **Keyboard** (ring 3) | The PS/2 driver is a user process. IRQ1 is masked by the kernel and forwarded to it as a `MSG_HARDWARE_INTERRUPT`; the driver reads port `0x60` itself under IOPL=3, decodes scancode set 1 with shift, sends each character to the input server as a `MSG_KEYPRESS`, and re-opens the line with `sys_unmask_irq` |
+| **I/O and IRQ grants** | `sys_grant_io` edits the caller's saved EFLAGS so it resumes with IOPL=3 — one OR of `0x3000`, leaving IF untouched — and is refused to every task the kernel did not mark as a driver. `sys_unmask_irq` re-opens a line and is refused to every task but the one the kernel routes that line to |
+| **Input server** (ring 3) | A focus manager with no privilege of its own. Applications subscribe by message, the driver sends it every key, and it forwards each to the one subscriber holding focus; Tab is consumed and rotates focus. A dead subscriber is detected by the send that fails and unsubscribed, with focus moving on |
+| **Applications** (ring 3) | Two identical programs that subscribe and print what they are given, plus `calc.elf`, which prints and exits. All start from the shell; none at boot |
+| **Kernel log** | The kernel has no `kprintf`. Its diagnostics go to an 8 KiB ring buffer through `klog`, read out by a ring-3 process with `sys_klog_read`; `panic_print` writes to the screen and is reserved for ring-0 fatal errors |
+| **Console server** (ring 3) | Owns the screen: the only mapping of `0xB8000`, granted by the kernel, and IOPL for the cursor ports. Four virtual terminals, each a 4000-byte backing buffer with its own cursor; output arrives as `MSG_PRINT_STR` messages of up to 31 characters, each placed whole on the sender's terminal, and on the hardware if that terminal is showing. The system console (terminal 0) shows the kernel log and every process without a terminal of its own, line-buffered per sender |
+| **Shell** (ring 3) | Prompt, line editing with destructive backspace, `help`, `ls`, `clear`, and any other word is a file to run: opened through the VFS server, copied by it into a shared segment the shell owns, and handed to `sys_spawn`. Holds no privilege |
+| **Spawn / exit / wait** | `sys_spawn(shm id, length)`: the caller must own or be peer to the segment; the kernel copies the image out before parsing it, bounds the parse by the stated length, and runs `elf_load`'s full validation. Nothing runs on failure. The child records its parent. `sys_exit(status)` frees the process's user memory and leaves a zombie holding the status; `sys_waitpid(pid, *status)` blocks until a child exits, reads its status and frees the corpse. A fault ends a process the same way, so waiting on a crash returns rather than hangs |
+| **Network driver** (ring 3) | An RTL8139, driven entirely from user space. The driver walks the PCI bus (ports `0xCF8`/`0xCFC`) to find vendor `0x10EC` device `0x8139`, reads its I/O base and IRQ, allocates a contiguous DMA receive ring, programs the card over I/O ports under IOPL=3, and claims the discovered IRQ; each receive interrupt is forwarded to it as a `MSG_HARDWARE_INTERRUPT`, and it reads the packet straight out of the DMA ring |
+| **DMA / dynamic IRQ** | `sys_alloc_dma(pages, *phys)` hands a driver contiguous, zeroed, pinned physical frames and their physical address, which a device's DMA engine needs (the only call that *allocates* memory to hand back its physical address; `sys_grant_info` reports one the loader placed). `sys_claim_irq(irq)` routes a line discovered at run time to the caller. Both are driver-only, gated on the same capability as I/O |
+| **Ethernet (layer 2)** | Each received frame is parsed where it lies in the DMA ring: a `__attribute__((packed))` 14-byte header cast over the first byte past the card's own 4-byte prefix, source and destination MAC formatted as six zero-padded hex bytes, and the EtherType read through `ntohs` and named — IPv4, ARP, IPv6, or left as the bare number. A frame too short to hold a header is reported and skipped without breaking the drain |
+| **Transmit / ARP** | Four transmit descriptors over two DMA pages split into 1536-byte buffers — room for a full 1514-byte frame — used strictly in order: the driver copies a frame in, hands the card that buffer's physical address, and writes the length to start the send, padding anything under 60 bytes with zeroes. On top of it, ARP: a request for `10.0.2.15` is answered with a reply built in its own buffer from the request — opcode flipped, sender and target swapped, every multi-byte field through `htons`/`htonl` — and a request for any other address is ignored |
+| **IPv4 / ICMP echo** | A received IPv4 datagram is validated in an order where every check reads only bytes an earlier one proved present: version and IHL, total length against the header and against the frame (`ntohs`, so Ethernet padding is never mistaken for payload), a 1500-byte cap, the header checksum over the whole header, no fragment, addressed to `10.0.2.15` at the IP layer and to this card's MAC at the Ethernet layer, and from a sane unicast source. An ICMP echo request that passes is answered with a reply built fresh: Ethernet and IP addressed from this machine's own identity, a rebuilt 20-byte IPv4 header, the request's identifier, sequence and data returned unchanged, and both checksums computed with their fields zeroed first (RFC 1071) |
+| **UDP / echo on port 7** | A UDP segment (RFC 768) is checked in the same read-only-what-is-proven order: room for the 8-byte header, the brief's `UDP Packet \| Port S -> D \| Length: L` line, a length at least the header and at most the datagram (anything between the two is ignored), and a non-zero checksum verified over a 12-byte pseudo-header — both IP addresses, protocol 17, the UDP length copied byte for byte from the header — laid in a static 1,492-byte scratch buffer ahead of the segment; the buffer is sized by the 1500-byte IPv4 cap, so no allocation is needed. The data is previewed on its own line with every non-printable byte shown as `.`. Port 7 echoes it back with the ports swapped, from this machine's own address, through the IPv4 reply builder ICMP shares, and a checksum that comes out as 0 is sent as `0xFFFF`. Source ports below 1024 and 2049 are refused, as OpenBSD's inetd does |
 
 ## Layout
 
@@ -80,10 +175,14 @@ src/cpu/idt_load.S      lidt
 src/cpu/isr_stubs.S     exception entry points + the shared interrupt tail
 src/cpu/isr.c           dispatch and exception reporting
 src/cpu/irq_stubs.S     IRQ 0-15 entry points
-src/cpu/irq.c           handler registration, dispatch, EOI
+src/cpu/irq.c           handler registration, dispatch, EOI; which ring-3 task
+                        owns a line, and forwarding a line to its owner
 src/cpu/pic.c           8259 remap and masking
-src/drivers/vga.c       text console
-src/drivers/keyboard.c  PS/2 keyboard
+src/drivers/vga.c       the kernel's text driver: clears the screen at boot,
+                        then used by panic alone
+src/drivers/keyboard.c  the kernel half of the keyboard: drains the controller at
+                        boot, hands IRQ1 to the ring-3 driver, drains again if
+                        no driver is alive. No scancode table
 src/drivers/pit.c       programmable interval timer, 100 Hz tick hook
 src/mm/pmm.c            physical frame allocator
 src/mm/paging.c         page directory, page tables, map_page, address spaces
@@ -94,15 +193,21 @@ src/task/task.c         task control blocks, process creation, physical grants
 src/task/elf.c          ELF32 loader: validates a module, maps its PT_LOAD segments
 src/task/switch.S       context switch and the first-run bootstrap
 src/task/scheduler.c    round robin over runnable tasks; schedule()
-src/sys/syscall.c       int 0x80 dispatcher: print, send, recv, yield,
-                        map_physical, grant_info, shm_map, shm_attach
+src/sys/syscall.c       int 0x80 dispatcher: send, recv, yield, map_physical,
+                        grant_info, shm_map, shm_attach, grant_io, unmask_irq,
+                        trust_sender, map_hw_buffer, klog_read, spawn, parent_of,
+                        exit, waitpid, alloc_dma, claim_irq. No print
 src/sys/uaccess.c       copy_from_user / copy_to_user with per-page validation
-src/ipc/ipc.c           ipc_send / ipc_recv over per-task mailboxes
+src/ipc/ipc.c           ipc_send / ipc_recv over per-task mailboxes, the
+                        pending-interrupt bits recv turns into messages, and the
+                        slot reserved for a task's one trusted sender
 
   --- everything below this line runs in ring 3, in its own address space ---
 
-src/user/lib/ulib.c     the whole user runtime: syscall wrappers, strings,
-                        number formatting. Linked into every program
+src/user/lib/ulib.c     the user runtime: syscall wrappers, strings, number
+                        formatting. Linked into every program
+src/user/lib/stdio.c    u_print and u_printf: format, then MSG_PRINT_STR
+                        chunks of up to 31 characters to the console server
 src/user/lib/atomic.S   compare_and_swap via lock cmpxchg -- the one thing in
                         userland that cannot be written in C
 src/user/lib/mutex.c    mutex_lock / mutex_unlock over that primitive
@@ -116,12 +221,57 @@ src/user/shm_writer/    creates a shared page, writes to it, sends only the id
 src/user/shm_reader/    attaches by id, reads, and writes back through the page
 src/user/mutex_a/       creates the contended page and races B for it
 src/user/mutex_b/       attaches to it and races A
+src/user/kbd_server/    the keyboard driver: raises its IOPL, waits for the
+                        kernel's interrupt message, reads port 0x60, decodes,
+                        sends each key to the input server, unmasks IRQ1
+src/user/input_server/  the focus manager: subscriptions by message, one focused
+                        pid, Tab rotates, a dead subscriber is unsubscribed by
+                        the send that finds it gone
+src/user/apps/app_a/    two identical applications that subscribe and print
+src/user/apps/app_b/    what they are given; only focus tells them apart
+src/user/vga_server/    the console: maps 0xB8000, four virtual terminals, the
+                        hardware cursor, the kernel log on terminal 0
+src/user/apps/shell/    the shell: line editing, built-ins, open + load through
+                        the VFS server, sys_spawn
+src/user/apps/calc/     the smallest spawnable program: prints and exits
+src/user/net_server/    the RTL8139 driver: PCI scan, DMA ring, IRQ claim, RX,
+                        Ethernet parsing, transmit (rtl8139.c), ARP (arp.c),
+                        IPv4 validation and the reply header (ipv4.c), ICMP
+                        echo (icmp.c) and UDP with the echo service (udp.c)
+src/user/lib/net.c      byte order (htons/ntohs/htonl/ntohl), the RFC 1071
+                        checksum, the Ethernet header writer, and the formatters
+                        for MAC addresses, IPv4 addresses and EtherTypes
+include/arch/pci.h      PCI config mechanism #1 (0xCF8/0xCFC) readers
+include/arch/rtl8139.h  RTL8139 register map and bits
+include/net/ethernet.h  the packed 14-byte Ethernet header and EtherTypes
+include/net/arp.h       the packed 28-byte ARP header and opcodes
+include/net/ipv4.h      the packed IPv4 header, its field helpers, and this
+                        machine's hardcoded address, subnet and gateway
+include/net/icmp.h      the packed ICMP echo header and its types
+include/net/udp.h       the packed UDP header and pseudo-header, and the ports
+include/net/checksum.h  the Internet checksum's contract, and why one's complement
+include/net/rtl8139.h   the driver module's own interface: transmit and the
+                        card's MAC (include/arch/rtl8139.h is the register map)
+include/net/byteorder.h host and network byte order, and why they differ
 
 tools/make_initrd.py    host-side packer; writes the format initrd.h declares
+tools/inject_frames.py  writes real Ethernet frames into QEMU's network card and
+                        decodes what comes back; the one definition of a test
+                        frame, and the RFC 768 reference, which `make netdemo`,
+                        `tools/ping.py` and `tools/udp_echo.py` use
+tools/ping.py           plays the host for `make ping`: echo requests in, every
+                        reply checked, refusals tested, liveness after each
+tools/udp_echo.py       plays the host for `make udp`: datagrams to port 7,
+                        every echo checked, refusals, the console read back
+tools/udp_host.py       `make udp-host`: the host's own nc through QEMU's
+                        user-mode network and its port forward
+tools/check_checksum.py builds net.c natively and checks net_checksum against
+                        RFC 1071's example, a reference, and its own properties
 initrd/                 files packed into the image, one per entry
 linker.ld               link map for the kernel image, loaded at 1 MiB
 user.ld                 link map for ring-3 binaries, at 0x40000000
-src/utils/stdio.c       kprintf
+src/utils/stdio.c       the formatter, panic_print and panic
+src/utils/klog.c        the kernel log: a ring buffer read out by ring 3
 src/utils/string.c      kstrlen, kstrncpy, kstrcmp, kmemcpy, kmemset
 ```
 
@@ -239,8 +389,10 @@ that makes it cheap is that the record of *who* holds a frame already exists —
 every present user page is one reference — so tearing an address space down is a
 walk that decrements, identical for a private page and a shared one. Refcounting
 alone would only have made the leak refcounted, though: nothing ran that
-teardown, so this phase also had to add the reaper, which runs in the idle task
-because a process cannot free the page directory it is executing on. A review
+teardown, so this phase also had to add the reaper, which ran in the idle task
+because a process cannot free the page directory it is executing on (phase 19
+moved it to the timer tick, once `sys_spawn` let any program start a task that
+never blocks and so starve the idle loop forever). A review
 then found the shared-memory ids were checked for existence but not entitlement,
 which let any process read every shared page by counting upwards.
 
@@ -251,17 +403,261 @@ instruction boundaries, so one instruction cannot be split — and what actually
 provides safety is that the read-modify-write *is* one instruction where the C
 equivalent is four. The prefix earns its keep on a second core.
 
-Every phase was reviewed adversarially afterwards by agents that build variants
-and boot them, and the reviews found real defects in most of them: a page
+**16. A ring-3 keyboard driver.** The scancode table left the kernel. IRQ1 now
+masks its own line, marks the interrupt pending on the driver process and
+switches to it; the driver reads port `0x60` itself and re-opens the line when
+it is done. It can read the port because the kernel raised its IOPL — one OR of
+`0x3000` into the EFLAGS image saved by a system call, which sets bits 13:12 and
+nothing else, so IF at bit 9 survives and the `iret` that ends the call loads
+the result. Two decisions were about what *not* to do. The interrupt is a bit in
+the control block rather than a message in the driver's single mailbox slot,
+because any process can fill that slot and would otherwise be able to make the
+driver miss keystrokes. And IOPL goes only to the task the kernel started as the
+driver, because IOPL=3 is every port on the machine and `cli` besides.
+
+**17. An input server as focus manager.** The keyboard driver stopped printing
+and started sending: every decoded key goes as a `MSG_KEYPRESS` to a third
+server, which forwards it to whichever subscribed application holds focus and
+consumes Tab to move focus along. The three core servers moved to the front of
+the module list so they hold pids 1–3. The design question was a dead
+subscriber. The kernel offers no notification, so death is detected where it is
+visible — a send that fails with `IPC_ERR_NO_TASK`, deterministic both before
+and after reaping because pids are never reused — and the recovery drops the
+keystroke that exposed it rather than handing it to whichever application
+comes next. A full mailbox is the other failure and gets the other answer: a
+bounded retry, then a drop, with the subscription kept. The review then found
+the hole the design had reopened: one unprivileged process looping a send at
+the server's well-known pid took every keystroke on the machine, 0 of 10
+delivered. The answer is a second mailbox slot a task reserves for the one
+sender it names — the pending-bit idea from phase 16, one hop further from the
+hardware — so the driver's keys and the server's forwards contend with nobody.
+Same flooder afterwards: 10 of 10.
+
+**18. A ring-3 console.** The kernel lost `kprintf`. What it had to say became
+a log — a ring buffer with a read syscall — and a fourth server, holding the
+only mapping of the VGA text buffer and IOPL for the cursor ports, shows that
+log and every process's output on four virtual terminals in its own memory.
+A process no longer prints; it sends the console one character per message,
+and the kernel-stamped sender is what decides which terminal the character
+lands on. Focus and screen move together: Tab shows the focused process's
+terminal, Escape shows the system console without moving focus. Two details
+mattered more than the rest: the hardware cursor is a cell index, `row*80 +
+column`, not a byte offset, split across two CRTC registers through an
+index/data port pair; and a shared terminal must be line-buffered per sender,
+or one-character messages from ten processes arrive as one line of alternating
+characters.
+
+**19. A shell, and `sys_spawn`.** The kernel now starts five processes and no
+more; everything else is a file the shell asks it to run. The shell opens the
+file through the VFS server, which copies it into a shared segment the shell
+created with the server as its one permitted peer, and then calls `sys_spawn`
+with the segment id and the length. The kernel trusts neither: the caller must
+own or be peer to the segment; the image is copied into kernel memory before
+a byte is parsed, so nothing still mapped writable elsewhere is what gets
+validated; the parse is bounded by the stated length so a short file cannot
+reach stale bytes from the last program loaded there; and the same `elf_load`
+that vets boot modules vets this, refusing bad magic, the wrong class or
+machine, a header or segment past the end, an entry outside the image, or a
+segment too large to be honest. Shared segments grew to sixteen pages for
+this, a process table cap went in so a spawn loop hits a wall, `sys_exit`
+lets a program end, and a child prints where its parent does because the
+console asks the kernel who spawned it. Output became up to 31 characters per
+message the moment a terminal had two writers.
+
+**20. Process exit and parent/child wait.** A process ends with `sys_exit(status)`
+rather than merely being marked dead: it frees its own user memory immediately —
+the bulk of what it held — and becomes a zombie holding its status, so a parent
+can learn how it fared. `sys_waitpid(pid, *status)` is the rendezvous: a parent
+blocks until the named child exits, reads its status, and frees the corpse's
+page tables, directory and control block. The shell waits on every command, so
+the prompt returns only when the program is done. A ring-3 fault now ends a task
+the same way — a zombie with a status carrying the trap vector — because the
+shell waits on a child that might crash, and a crash that did not wake the
+waiter would hang the shell forever. The orphan case, a child whose parent dies
+before waiting, is handled by the tick reaper doubling as `init`: it collects
+any zombie whose parent is gone, so a corpse is never left uncollected.
+
+**21. A network card, over DMA.** An RTL8139 driven from ring 3. The driver
+finds the card on the PCI bus, and the kernel gains the two things a device
+driver needs beyond I/O ports: `sys_alloc_dma`, which allocates contiguous
+physical frames and returns their physical address, because a DMA engine
+addresses physical memory the process's virtual addresses mean nothing to
+(`sys_grant_info` also hands back a physical address, but of a boot module the
+loader placed, not freshly allocated memory); and
+`sys_claim_irq`, which routes a line the driver discovered at run time, since
+the kernel cannot know a PCI device's interrupt before the bus is scanned. The
+PMM learned to find a contiguous run of free frames (first-fit over runs, not
+frames) and to pin them, because a card keeps the physical pointer it was
+handed and must never DMA into memory the kernel has since reused. Everything
+that could be a hardware fact rather than kernel knowledge is: the kernel never
+learns what a packet is, only that a line the driver claimed fired. Verified by
+injecting Ethernet frames into the emulated card and watching the driver read
+them out of the ring.
+
+**22. Reading the frame.** Until now a packet was a length. Layer 2 makes it a
+structure: a 14-byte Ethernet header cast in place over the DMA ring, six bytes
+of destination MAC, six of source, and an EtherType naming what is inside.
+
+Two things stand between a C struct and a wire format, and both are silent when
+they go wrong. The first is padding — GCC lays out a struct for the 32-bit ABI,
+aligning members and rounding the total size up, which is right for a struct the
+compiler owns and wrong for fourteen bytes another machine wrote.
+`__attribute__((packed))` is what makes the cast an identity rather than a hope,
+and `_Static_assert` on the size, the alignment and every member's offset turns
+the promise into a build failure instead of a run-time misread. The alignment
+assert is there because measuring showed the others were not enough: deleting
+the attribute leaves this struct's size and offsets identical and only its
+alignment changes, so the offset checks alone would have waved the edit through. The second is byte order:
+the wire is big-endian, x86 is little-endian, and an EtherType read without
+`ntohs` is 0x0008 rather than 0x0800 — not a protocol at all, and nothing
+faults. Both conversions and both formatters live in the user runtime, not the
+driver, because byte order is a property of the architecture and a MAC address
+formats the same way whoever prints it.
+
+The parsing is bounds-checked before it is a cast: the card's length field is 16
+bits and the buffer is 12 KiB, so a frame longer than Ethernet allows is never
+read. Getting the *recovery* right took a second attempt. The first version
+stopped the drain on a bad length — which sounds careful and was in fact a
+permanent, silent denial of service, because stopping without moving the read
+offset left the driver parked on that same header for the rest of the machine's
+uptime. A review injected one 1600-byte frame and watched every valid packet
+after it vanish. Now an over-long frame is stepped over by the length the card
+reported (one packet lost), and a header that cannot be believed at all
+resynchronises to the card's own write head (what was in flight is lost). Both
+move `CAPR`, which is the property that actually matters.
+
+**23. Saying something.** Until this point the machine only ever listened. TX
+is four descriptors — not a ring, just four slots used in rotation, each pairing
+a register holding a buffer's physical address with one that is write-the-length
+-to-send and read-it-back-for-status. The handshake bit reads backwards from its
+name: the driver *clears* `OWN` by writing a length, meaning the card owns the
+buffer now, and the card *sets* it when the DMA is done. Waiting for a free slot
+is waiting for `OWN` to become 1.
+
+On top of that, ARP, which is the smallest protocol worth implementing and the
+first one where this system answers rather than observes. A request for
+`10.0.2.15` comes in; the reply is the request turned around, with the opcode
+changed and the sender and target swapped, and every multi-byte field run
+through `htons`/`htonl` on the way out.
+
+Byte order is where this would have failed silently. An IPv4 address written as
+`0x0A00020F` reads left to right like the address it is, but x86 stores it in
+memory as `0F 02 00 0A` — backwards from the wire — so `htonl` is not decoration,
+it is the difference between claiming to be `10.0.2.15` and claiming to be
+`15.2.0.10`. The MAC addresses need none of it, because a byte array has no
+endianness. And `arp_header_t` is the first struct here where `__attribute__
+((packed))` changes the layout rather than just the alignment: a `uint32_t` lands
+at offset 14, so without packing the compiler inserts two bytes, shifts every
+field after it, and grows 28 bytes into 32.
+
+Proven both ways. Against QEMU's own stack, the driver ARPs the gateway at
+startup and the gateway replies — a real peer answering, which it would not do
+if a single field were byte-swapped wrong. Against an injected request, the
+frame the guest puts on the wire is read back and decoded byte by byte: opcode
+2, sender `52:54:00:12:34:56` / `10.0.2.15`, target the asker, padded 42 to 60.
+A request for an address this machine does not own draws no reply at all.
+
+**24. Answering a ping.** Above ARP, the first IP. A received IPv4 datagram is
+validated in an order where every check reads only bytes an earlier one proved
+are there — the frame long enough for a header, then the header's own length,
+then the datagram's length against the header and the frame, and only then a
+checksum over bytes now known to be present. What passes and is an ICMP echo
+request gets an echo reply.
+
+The checksum is RFC 1071's: the one's complement of the one's-complement sum of
+16-bit words. One's-complement addition feeds the carry out of bit 15 back into
+bit 0, which makes it arithmetic modulo 65535 rather than 65536, and that single
+difference is the design. 256 × 256 = 65536, which is 1 modulo 65535, so
+swapping a word's bytes is the same as multiplying it by 256 — the sum of swapped
+words is the swapped sum, and machines of either byte order compute identical
+checksums. No carry is ever thrown away, so every bit position is
+protected alike: two top-bit errors in the same direction change a two's-
+complement sum by 65536, which is 0, but a one's-complement sum by 1. (Errors in
+opposite directions in the same bit still cancel under either — an earlier
+version of this paragraph claimed they did not, and `tools/check_checksum.py`
+now tests both directions.) And the check needs no knowledge of where
+the checksum lives: sum everything, checksum included, and a correct message
+comes to zero. The one rule that matters in code is the brief's: zero the field
+before computing, because the checksum is defined over the header as if it were
+zero.
+
+The reply is built fresh rather than by swapping the request's fields in place.
+For a request unicast to this machine a swap gives the same answer; the
+difference is in what a swap copies blindly — a broadcast destination MAC
+becoming the reply's source, the request's options and TTL and checksum riding
+back. The transmit buffers grew to 1536 bytes for it, because an echo reply is
+exactly as long as its request and a full-size ping is a 1514-byte frame.
+
+The host's own `ping` never ran, and could not: user-mode networking is NAT with
+no inbound ICMP, and the TAP device that would give the host a route needs root.
+So `make ping` plays the host over a socket netdev, and the evidence is built to
+be hard to fool. Every reply is checked field by field against a checksum written
+from the RFC rather than from `net.c`. Every refusal is followed by a proper ping,
+because silence proves nothing about a guest that might have crashed. And every check is shown to be load-bearing: eighteen
+mutant kernels, each disabling exactly one test, and `make ping` fails against
+every one, each time on the case named for the check it removed. That took a
+second attempt. The review found that my first suite built its malformed
+headers with checksums over the wrong bytes, so four refusal cases were really
+stopped by a checksum failure and deleting the check each was named for — the
+IHL check, the frame bound, the 1500-byte cap, the ICMP minimum length — left
+it green. One of those, the frame bound, is what keeps bytes from past the end
+of a frame from being echoed back onto the wire. `tcpdump`, reading only what
+the guest sent, counts 46 echo replies and no checksum complaints.
+
+**25. UDP, and an echo server.** The first transport layer: two port numbers, a
+length, and a checksum that covers not only the datagram but a pseudo-header of
+fields borrowed from the IP header — both addresses, the protocol, the length —
+so that a datagram delivered intact to the wrong machine still fails it. The
+pseudo-header is never sent. It is laid in a scratch buffer ahead of the segment
+only to be summed, and the question this phase was asked is how that buffer is
+sized when a payload's length is only known on arrival. It is not sized on
+arrival: the longest possible segment is fixed at compile time by checks that
+run before UDP sees a byte — the 1500-byte IPv4 cap, a header of at least 20,
+and a segment no longer than its datagram — so a static 1,492-byte buffer holds
+every one, and the length that arrives only decides how much is summed. Ring 3
+has no heap to allocate from anyway.
+
+Port 7 answers with the same bytes. One's complement has two zeroes, and UDP
+spends one of them — a transmitted 0 means "no checksum" — so a checksum that
+comes out as 0 goes out as `0xFFFF`, which verifies just the same. And
+whenever a request carries a checksum, the echo's is equal to it, since swapping
+the addresses and ports only reorders the sum; a guest that copied it instead of
+computing it would pass any test that sends a checksum, so the tests also send
+requests without one. Echo refuses source ports below 1024 and NFS's 2049,
+because echo answering echo or chargen never stops, and because it would
+otherwise hand bytes an attacker chose to NFS, which trusts a client by its
+port.
+
+Unlike ping, this reaches the host: QEMU forwards `127.0.0.1:7007` to the
+guest's port 7, and `nc -u 127.0.0.1 7007` gets back what it sends, through a
+UDP/IP stack this project did not write. `make udp-host` does it headless with
+the host's own netcat and reads the guest's screen out of VGA memory to see the
+datagram arrive. That path cannot prove the checksum is computed: QEMU's stack
+always hands the guest a checksummed request, and a correct echo's checksum
+equals it, so a guest that copied it would pass — while a missing checksum
+would be caught there too, by the same `tcpdump` gate. So `make udp` proves it
+over a socket netdev, where a request can carry none. Fifty-five mutant kernels,
+each deleting one check or breaking one rule — the pseudo-header's protocol, the
+zero rule, the port swap, a missing `ntohs`, a reply sent to the wrong host —
+and every one that can be caught is caught by the case named for it; two
+guards nothing can reach are shown to be exactly that.
+
+Every phase was reviewed adversarially afterwards, by building variants and
+booting them, and the reviews found real defects in most of them: a page
 directory that was never zeroed, a buffer overflow in a directory listing, an
-unbounded retry that let one client hang a system service, and the capability
-hole above among them. Where a review refuted a claim, that is recorded too.
+unbounded retry that let one client hang a system service, the capability hole
+above, and a driver-death path that reported the keyboard controller's stale
+acknowledge byte as a dropped keystroke, and an unprivileged flood that took the
+keyboard away from every process among them. Where a review refuted a
+claim, that is recorded too.
 
 ## Design invariants
 
 These are the things that break quietly if you change one half of a pair. Each
 one caused, or would have caused, a real bug.
 
+- **Every object depends on the Makefile itself**, so changing a compiler flag
+  forces a full rebuild instead of leaving stale objects with mismatched ABI.
 - **The interrupt frame layout lives in two places.** `struct registers` in
   `include/cpu/isr.h` is a direct view onto the stack that `src/cpu/isr_stubs.S`
   builds. Change the push sequence without changing the struct (or the reverse)
@@ -307,6 +703,25 @@ one caused, or would have caused, a real bug.
   mailbox into the receiver's own buffer when it wakes. Each half validates
   exactly one task's memory, and the kernel overwrites `sender_pid` rather than
   trusting it.
+- **The idle task is a fallback, not a peer.** The scheduler skips it while
+  any other task is runnable and hands it the CPU only when the caller has
+  blocked or died. Scheduled as an equal, it took every other tick while the
+  receiver sat blocked, so the CPU halted for half of all wall time, a `yield`
+  handed the CPU to `hlt` instead of to the task just woken, and IPC under
+  load was capped at one message per tick. Fixing that doubled the demo's
+  message rate without touching IPC.
+- **Every send target must be able to collect the message.** A missing pid, a
+  dead task, a user task that has faulted, and the idle task (which never calls
+  `recv`) are all refused with `IPC_ERR_NO_TASK`. Accepting the send instead
+  reports success for a message that is parked forever, and for the idle task
+  it parks 44 user-chosen bytes inside the kernel's own control block. This is
+  why a ring-3 fault ends the task as a zombie (`TASK_ZOMBIE`, its status the
+  trap vector) rather than merely halting it — so a parent waiting on it wakes.
+- **Pids are never reused.** Dead tasks stay linked in the ring and `task_find`
+  has no state filter, so a recycled pid could resolve to the corpse or the new
+  task depending on who is asking; and `sender_pid` is a bare integer, so a
+  reply to a pid that died and was reissued would reach the new holder
+  undetectably. Reuse needs unlinking and a generation counter first.
 - **`p_memsz` sizes the memory, `p_filesz` sizes the copy.** The difference is
   `.bss`: bytes that must exist and read as zero but occupy nothing in the
   file. Allocating frames from `p_filesz` gives a program that faults on its
@@ -314,74 +729,6 @@ one caused, or would have caused, a real bug.
   copies only `p_filesz` bytes over it, which makes the `[p_filesz, p_memsz)`
   gap, the slack past the end of the last page, and the leftover bytes of a
   recycled frame all handled by the same act.
-- **A reference count says how many, page tables say who.** The record of which
-  process holds a frame already exists: every present user page in an address
-  space is one reference. So tearing an address space down is a walk that
-  decrements, and it is the same walk for a private stack page as for a shared
-  one — the count decides which gets freed. That uniformity is the reason
-  refcounting is worth having, not a side effect of it.
-- **Refcounting alone does not stop a leak; something has to run the teardown.**
-  Before this, a process killed at run time was marked dead and parked, and its
-  frames were never reclaimed. Reference counts on their own would only have
-  made that leak refcounted.
-- **A process cannot free the address space it is executing on.** The page
-  directory being torn down is the one translating the instruction doing the
-  tearing, so reaping is deferred to the idle task, which runs on the kernel's
-  own address space and always exists.
-- **Reserved memory is pinned, not counted.** Firmware, the kernel image and
-  the boot modules were never allocated, so a mapping of one must never be able
-  to count down to zero. A process that maps the initrd and then dies decrements
-  every page it held; the sentinel is what stops that walk from putting boot
-  modules into the free pool. Verified by killing the VFS server mid-flight and
-  checking the initrd's frame afterwards.
-- **The count saturates rather than wrapping.** Rolling over from 255 to 0 frees
-  a frame that every one of those address spaces is still mapping, which hands
-  ring 3 a use-after-free. The share is refused instead.
-- **A shared id must outlive its last holder's death.** The registry keeps a
-  reference of its own, so an id can never name a frame the allocator has since
-  handed to somebody else, and the entry retires only when the count falls back
-  to that one reference. Ids are never reused, for the same reason pids are not.
-- **A lock must live in the memory it protects.** The mutex word sits at offset
-  0 of the shared frame, so both processes contend on one physical word. A lock
-  in either process's private memory would be two locks, each of which always
-  looks free to its owner, and the mutual exclusion would be imaginary.
-- **What makes a compare-and-swap safe on one core is that it is one
-  instruction**, not the `lock` prefix. Interrupts are taken at instruction
-  boundaries, so a single instruction cannot be split by the scheduler; the
-  equivalent C `if (x == 0) x = 1;` is four instructions with three places for
-  the timer to land. The prefix is what makes it correct on a second core, and
-  costs one byte, so it is written now rather than left as a trap for whoever
-  adds SMP.
-- **The compiler is the other adversary.** A shared word is written by a process
-  this compiler cannot see, so a plain read may be hoisted out of the retry loop
-  or cached in a register forever. Hence `volatile` on the lock word, a memory
-  clobber in the asm, and a compiler barrier before the release store — x86 will
-  not reorder the store itself, but the optimizer will happily sink a write from
-  inside the critical section past it.
-- **A failed acquisition must yield, not spin.** On one core the lock holder is
-  by definition not running, so spinning re-reads a word that cannot change
-  until the spinner stops. Measured: ~20 failed acquisitions per task when
-  yielding, ~11,000,000 when spinning, for identical work and identical results.
-- **A capability is a noun, not a verb.** `sys_map_physical` is gated on two
-  things that answer different questions. A bit in the control block says *who*
-  may call it, and ring 3 cannot reach that bit because the control block is on
-  a supervisor page and no system call sets it. A recorded physical range says
-  *what* they may map. The bit alone would make the VFS server exactly as
-  dangerous as the kernel, since one parser bug in ring 3 would then reach
-  kernel text. The range comes from the boot loader's module list and never
-  from anything the caller says.
-- **The kernel picks the virtual address a grant lands at.** A caller that
-  chose its own could map over its own stack or its own code, which turns a
-  mapping call into a way to corrupt itself.
-- **Module order is a contract between the Makefile and `kernel.c`.** The
-  kernel has no filesystem, so it identifies the server, the client and the
-  filesystem image purely by position in the Multiboot module list. Reordering
-  the list in the Makefile starts the wrong program and grants it the wrong
-  memory, and nothing would report an error.
-- **The server's pid is fixed by creation order.** A client has to name the
-  server before it has spoken to anything, so `VFS_SERVER_PID` is compiled in.
-  The kernel creates the server first to make that true, and checks the result
-  rather than assuming it.
 - **An address space may only write page tables it owns.** Kernel tables are
   shared into every address space rather than copied, so a mapping written into
   one of them does not shadow the kernel's entry, it overwrites it, everywhere
@@ -424,24 +771,32 @@ one caused, or would have caused, a real bug.
   slack below the 4 MiB rounding boundary; a 2 MiB initrd consumed the slack
   and the heap alone exhausted the window, so no user task could start on a
   machine with 128 MiB free.
-- **The idle task is a fallback, not a peer.** The scheduler skips it while
-  any other task is runnable and hands it the CPU only when the caller has
-  blocked or died. Scheduled as an equal, it took every other tick while the
-  receiver sat blocked, so the CPU halted for half of all wall time, a `yield`
-  handed the CPU to `hlt` instead of to the task just woken, and IPC under
-  load was capped at one message per tick. Fixing that doubled the demo's
-  message rate without touching IPC.
-- **Every send target must be able to collect the message.** A missing pid, a
-  dead task, a user task that has faulted, and the idle task (which never calls
-  `recv`) are all refused with `IPC_ERR_NO_TASK`. Accepting the send instead
-  reports success for a message that is parked forever, and for the idle task
-  it parks 44 user-chosen bytes inside the kernel's own control block. This is
-  why a ring-3 fault marks the task `TASK_DEAD` rather than merely halting it.
-- **Pids are never reused.** Dead tasks stay linked in the ring and `task_find`
-  has no state filter, so a recycled pid could resolve to the corpse or the new
-  task depending on who is asking; and `sender_pid` is a bare integer, so a
-  reply to a pid that died and was reissued would reach the new holder
-  undetectably. Reuse needs unlinking and a generation counter first.
+- **A capability is a noun, not a verb.** `sys_map_physical` is gated on two
+  things that answer different questions. A bit in the control block says *who*
+  may call it, and ring 3 cannot reach that bit because the control block is on
+  a supervisor page and no system call sets it. A recorded physical range says
+  *what* they may map. The bit alone would make the VFS server exactly as
+  dangerous as the kernel, since one parser bug in ring 3 would then reach
+  kernel text. The range comes from the boot loader's module list and never
+  from anything the caller says.
+- **The kernel picks the virtual address a grant lands at.** A caller that
+  chose its own could map over its own stack or its own code, which turns a
+  mapping call into a way to corrupt itself.
+- **Module order is a contract between the Makefile and `kernel.c`.** The
+  kernel has no filesystem, so it identifies the server, the client and the
+  filesystem image purely by position in the Multiboot module list. Reordering
+  the list in the Makefile starts the wrong program and grants it the wrong
+  memory, and nothing would report an error.
+- **Well-known pids are fixed by creation order, and the core servers come
+  first.** A program has to name the VFS server, the keyboard driver or the
+  input server or the console before it has spoken to anything, so those four
+  constants are compiled in and the kernel creates those four processes first,
+  in that order, so they hold 1, 2, 3 and 4. The shell is 5, and nothing
+  addresses it. Every well-known pid is checked at boot
+  rather than assumed — and a module that fails to load still consumes its
+  pid, because otherwise the program after it inherits the address and
+  receives everything sent there, which no check can see since the process
+  the check is looking for does not exist.
 - **A server must not stake its liveness on a client.** Replies are sent with a
   bounded retry and then dropped. An unbounded retry means any process that
   stops collecting its replies parks the server inside the send forever, which
@@ -454,13 +809,323 @@ one caused, or would have caused, a real bug.
   against the buffer it will be copied into. The read path takes a byte count
   from the payload, so without that check a peer could name a length of 255
   into a 32-byte stack buffer.
-- **Every object depends on the Makefile itself**, so changing a compiler flag
-  forces a full rebuild instead of leaving stale objects with mismatched ABI.
+- **A reference count says how many, page tables say who.** The record of which
+  process holds a frame already exists: every present user page in an address
+  space is one reference. So tearing an address space down is a walk that
+  decrements, and it is the same walk for a private stack page as for a shared
+  one — the count decides which gets freed. That uniformity is the reason
+  refcounting is worth having, not a side effect of it.
+- **Refcounting alone does not stop a leak; something has to run the teardown.**
+  Before this, a process killed at run time was marked dead and parked, and its
+  frames were never reclaimed. Reference counts on their own would only have
+  made that leak refcounted.
+- **A process cannot free the address space it is executing on.** So teardown
+  is split. `sys_exit` and the fault path free only the *user leaf frames*,
+  which is safe to do as the exiting task because it returns them to the
+  allocator and then reads no user memory before it yields, with interrupts
+  off so nothing else can be handed one meanwhile. The page tables and the
+  directory — the structure the CPU is translating through — are freed later,
+  by whoever collects the corpse, running on another address space: a parent
+  in `sys_waitpid`, or the tick reaper for an orphan. Neither ever collects the
+  task it runs on.
+- **Reserved memory is pinned, not counted.** Firmware, the kernel image and
+  the boot modules were never allocated, so a mapping of one must never be able
+  to count down to zero. A process that maps the initrd and then dies decrements
+  every page it held; the sentinel is what stops that walk from putting boot
+  modules into the free pool. Verified by killing the VFS server mid-flight and
+  checking the initrd's frame afterwards.
+- **The count saturates rather than wrapping.** Rolling over from 255 to 0 frees
+  a frame that every one of those address spaces is still mapping, which hands
+  ring 3 a use-after-free. The share is refused instead.
+- **A shared id must outlive its last holder's death.** The registry keeps a
+  reference of its own, so an id can never name a frame the allocator has since
+  handed to somebody else, and the entry retires only when the count falls back
+  to that one reference. Ids are never reused, for the same reason pids are not.
+- **A lock must live in the memory it protects.** The mutex word sits at offset
+  0 of the shared frame, so both processes contend on one physical word. A lock
+  in either process's private memory would be two locks, each of which always
+  looks free to its owner, and the mutual exclusion would be imaginary.
+- **What makes a compare-and-swap safe on one core is that it is one
+  instruction**, not the `lock` prefix. Interrupts are taken at instruction
+  boundaries, so a single instruction cannot be split by the scheduler; the
+  equivalent C `if (x == 0) x = 1;` is four instructions with three places for
+  the timer to land. The prefix is what makes it correct on a second core, and
+  costs one byte, so it is written now rather than left as a trap for whoever
+  adds SMP.
+- **The compiler is the other adversary.** A shared word is written by a process
+  this compiler cannot see, so a plain read may be hoisted out of the retry loop
+  or cached in a register forever. Hence `volatile` on the lock word, a memory
+  clobber in the asm, and a compiler barrier before the release store — x86 will
+  not reorder the store itself, but the optimizer will happily sink a write from
+  inside the critical section past it.
+- **A failed acquisition must yield, not spin.** On one core the lock holder is
+  by definition not running, so spinning re-reads a word that cannot change
+  until the spinner stops. Measured: ~20 failed acquisitions per task when
+  yielding, ~11,000,000 when spinning, for identical work and identical results.
+- **IOPL is raised with one OR, on the saved frame, never on the live
+  register.** `eflags |= 0x3000` sets bits 13:12 and touches nothing else, so
+  IF at bit 9 — the neighbour that matters — and every arithmetic flag come
+  through as the task left them. Assigning `0x3000` instead would clear IF and
+  resume the task with interrupts off, never to be preempted again. It has to
+  be the frame because `iret` at CPL 0 is the only instruction that loads IOPL;
+  a `popf` from ring 3 leaves the field alone without faulting. Once set it
+  travels with the task, since every interrupt saves that task's EFLAGS into
+  its own frame, and it reaches no other task.
+- **A forwarded interrupt is a bit, not a message.** Any process can fill the
+  driver's single mailbox slot. If the interrupt had to land there, a hostile
+  peer could make the driver miss keystrokes at will; as a pending bit it
+  cannot be crowded out, and `recv` turns it into a `MSG_HARDWARE_INTERRUPT`
+  ahead of anything waiting in the slot. One bit per line is exactly the right
+  size, because the line is masked from the moment it is forwarded until the
+  driver reopens it, so at most one event per line can ever be outstanding.
+- **A line is masked before its owner is told, and only its owner may reopen
+  it.** Letting any process unmask any line would hand it the interrupt
+  controller. Ownership is recorded as a pid rather than a task pointer so a
+  driver that dies and is reaped leaves nothing dangling — `task_find` simply
+  stops finding it, and the kernel's fallback takes over.
+- **EOI-before-callback still holds for a forwarded line.** The brief's order
+  (mask, send, acknowledge) and the kernel's (acknowledge, mask, send) are
+  indistinguishable to the hardware: the gate cleared IF, so nothing is
+  delivered until the `iret`, and by then the mask is in place. Moving the EOI
+  after the send would reintroduce the exact hazard the central EOI exists to
+  prevent, since forwarding switches tasks and does not return.
+- **The kernel reads the byte itself when no driver is alive.** The 8042 holds
+  IRQ1 asserted while its output buffer is full, the 8259 is edge triggered,
+  and a line that never falls never rises again. Dropping a scancode costs one
+  keystroke; leaving it in the controller costs the keyboard until reboot.
+- **Interrupts are routed to the task the kernel created, not to the
+  constant.** `KBD_SERVER_PID` is a checked contract like the other well-known
+  pids, but the route and the I/O grant name `kbd->pid`, so an earlier module
+  failing to load shifts the pid and produces a warning rather than a dead
+  keyboard.
+- **The sender that matters gets a slot nobody else can fill.** A single
+  mailbox slot is first come, first served, and a process that knows a
+  server's well-known pid can keep it full from a tight loop; measured, one
+  such process cost every keystroke on the machine. `sys_trust_sender` reserves
+  a second slot for one named sender, drained ahead of the first. It changes
+  only the caller's own mailbox, so it needs no privilege, and it protects
+  exactly one relationship — the driver into the input server, the input
+  server into each application — which is the one that has to work.
+- **A dead pid is detected by the send, and only by the send.** The kernel
+  marks a faulting task dead at once and reaps it later, and `ipc_send`
+  refuses both states with `IPC_ERR_NO_TASK`; pids are never reused, so the
+  number cannot come to mean a live process. There is no window in which a
+  send to a dead process succeeds or is ambiguous, which is what lets the
+  input server treat one return code as the whole death notification.
+- **The keystroke that exposes a death is dropped, not rerouted.** The user was
+  typing into the process that died. Delivering that character to whichever
+  application is next is the one recovery worse than losing it. One lost
+  keystroke per crash, never a misrouted one, and a printed line saying focus
+  moved.
+- **A full mailbox is not a dead process.** `IPC_ERR_FULL` means alive and
+  slow; `IPC_ERR_NO_TASK` means gone. The input server retries the first a
+  bounded number of times and keeps the subscription, and unsubscribes on the
+  second. Conflating them would either unsubscribe every application that fell
+  one keystroke behind or retry forever into a corpse.
+- **Keys are accepted from the driver's pid and from nowhere else**, and
+  applications accept keys from the input server's pid and from nowhere else.
+  Both checks are on the kernel-stamped sender. Without the first, any process
+  could type into any application through the server; without the second, it
+  could do so directly.
+- **The kernel does not print.** There is no `kprintf`. Diagnostics go to the
+  kernel log and are shown by the console server, which owns the screen; the
+  kernel writes to the screen only to panic, when there is nothing above it
+  left to trust. A ring-3 fault is a diagnostic and goes to the log; a ring-0
+  fault is the end and goes to the screen.
+- **The screen is a capability.** One page of physical memory, mapped writable
+  into exactly one process by a kernel-set bit no system call can set. Every
+  other process's output is a message whose sender the kernel stamps, so no
+  process can write on another's terminal or pretend to be the input server
+  and change what is showing.
+- **The hardware cursor is a cell index, not a byte offset.** `row * 80 +
+  column`, written as two bytes to CRTC registers `0x0E`/`0x0F` through the
+  `0x3D4`/`0x3D5` index/data pair. Writing the byte offset puts the cursor
+  twice as far along the screen.
+- **A shared terminal is line-buffered per sender.** Output arrives one
+  character per message and processes run interleaved, so the system console
+  holds each sender's text until its newline and then places the line whole.
+  A process's own terminal has one writer and shows each character at once.
+- **The log reader's position is an offset into everything ever logged.**
+  `sys_klog_read` takes the offset the reader has reached and returns where
+  the delivered bytes actually start, which is later if the ring has wrapped
+  past the reader; the next offset is start plus length. There is no separate
+  "you missed some" flag to get out of step with the data.
+- **The reaper never reaps the task it runs on.** It walks the ring from the
+  interrupted task and skips it, and runs only from the timer tick with
+  interrupts masked. It ran in the idle task until `sys_spawn` let any program
+  create a task that never blocks — two bytes, `jmp` to self — which starved
+  the idle task forever and with it every reclamation, until the process table
+  filled for good; and it must not also run anywhere interrupts are enabled, or
+  two reapers, one interruptible by the other, would race inside `kfree`.
+- **Copy, then validate, then run.** `sys_spawn` copies the image out of the
+  shared segment into kernel memory before parsing it. The frames stay mapped
+  and writable in two ring-3 processes, and validating bytes something else
+  can still write is a time-of-check/time-of-use hole that a second core would
+  make real. On one core the syscall runs with interrupts off and nothing can
+  interleave; the copy is what keeps that from being load-bearing.
+- **The stated length bounds the parse.** A segment is reused for every
+  program the shell runs, so bytes of the last program sit past the end of the
+  current one. Without the caller's length, a truncated file's headers could
+  point into them and the kernel would assemble a program out of two.
+- **Every process comes to exist through one function.** Boot modules and
+  spawned images both go through `process_spawn`: `elf_load` then
+  `create_user_process`. One set of checks, applied identically, and a fix to
+  either path is a fix to both.
+- **A process cap is what a spawn loop hits.** The identity window is sized at
+  boot for a fixed number of processes; past it, frames stop being reachable
+  and the failure mode is obscure. Refusing creation at that number makes the
+  failure a line in the log instead.
+- **A child prints where its parent prints, and the kernel is the one that
+  says who the parent is.** The console asks with `sys_parent_of` rather than
+  believing any message: a process claiming another as its child would
+  otherwise be able to redirect that process's output onto its own terminal.
+- **A terminal with two writers needs atomic messages.** One character per
+  message was correct while every terminal had one writer; a shell and its
+  child interleaved at character granularity. Up to 31 characters per message,
+  placed whole, is the fix; the console's per-sender line buffer still guards
+  the shared system console against longer lines.
+- **Exit frees the frames; wait frees the shell.** A zombie holds only its
+  page tables, directory, kernel stack and control block — kilobytes — not its
+  user pages, which went at exit. So a parent that is slow to wait, or the one
+  tick before the orphan reaper runs, costs the corpse's bookkeeping and not
+  its whole footprint.
+- **A fault is an exit.** A ring-3 fault produces a zombie with a status
+  carrying the trap vector, identical in every other way to `sys_exit`. One
+  collection path, one wake path — and a parent waiting on a child that
+  crashes is woken and told, instead of blocking on a corpse that never
+  reported. Making a fault merely halt the task would deadlock any waiter.
+- **Only a parent reaps its child, and the reaper reaps orphans.** `sys_waitpid`
+  refuses a pid that is not a living child of the caller, so a process cannot
+  read another's exit status or free its corpse. A zombie whose parent has died
+  — or whose parent is the kernel, which never waits — is an orphan, collected
+  by the tick reaper; pids are never reused, so a `parent_pid` can never come to
+  name a different live task and cause a wrongful collection, and a parent
+  blocked in `waitpid` counts as alive so the reaper never races it.
+- **Collection is all-or-nothing.** A zombie is torn down completely — page
+  tables, directory, kernel stack, control block — by its parent's `waitpid` or,
+  if orphaned, by the next tick. Its user frames went at exit and its pid is
+  never reused.
+- **A physical address is a driver's business, not a process's.** Two calls
+  hand one to ring 3 and both are privileged: `sys_grant_info` reports where the
+  loader put a module (gated on `may_map_physical`), and `sys_alloc_dma`
+  allocates fresh contiguous memory and returns where it landed (gated on
+  `may_use_io`), because a device's DMA engine speaks physical and an ordinary
+  process has no business knowing where its pages live. The frames are contiguous (a device DMAs across
+  one buffer), zeroed (a recycled frame carries another process's bytes), and
+  pinned once mapped — a card keeps the pointer after its driver dies, so the
+  frames must never return to the pool to be reused under it. The cost is that
+  a DMA buffer is never reclaimed; a driver that restarts leaks it.
+- **Contiguity is searched, not assumed.** `pmm_alloc_contiguous` is first-fit
+  over *runs*: a used frame resets the run, so only genuinely adjacent free
+  frames accumulate to the count. Fragmentation is a real, reported failure —
+  there is no compaction, since a mapped frame cannot be moved — not something
+  papered over.
+- **A driver claims its own interrupt line, and the kernel guards which.**
+  `sys_claim_irq` routes a discovered line to the caller, but refuses the timer,
+  the keyboard, the cascade (IRQ 2, through which every slave line reaches the
+  CPU), and any line another driver already owns. A claimed line installs a
+  generic forwarder; when its driver dies the line is masked and the handler
+  removed rather than reopened, because there is no generic way to drain an
+  arbitrary device and a reopened unstaffed line would storm the CPU.
+- **A struct cast over wire data is packed, asserted, and byte-swapped.** The
+  compiler's layout rules serve the compiler's own structs; fourteen bytes
+  written by another machine answer to IEEE 802.3 instead. `ethernet_header_t`
+  carries `__attribute__((packed))` so its layout *is* the wire's, and
+  `_Static_assert` on its size, its alignment and each member's offset makes a
+  future edit that reintroduces padding — or deletes the attribute — a build
+  failure rather than a silent misparse. Every
+  multi-byte field is read through `ntohs`/`ntohl`, never used raw. Packing also
+  drops the struct's alignment to 1, which is what makes casting it over an
+  arbitrary ring offset correct rather than lucky.
+- **A malformed frame must not be able to kill the driver — and "kill" includes
+  going quiet.** The card's length field is 16 bits and the DMA buffer is 12 KiB,
+  so an over-long frame is never read; it is stepped over using the length the
+  card itself reported, costing one packet. A frame too short to hold a header is
+  reported and skipped. A header that cannot be believed at all — no receive bit,
+  or too short to hold even the CRC — resynchronises to `CBR`, the card's own
+  write head, discarding what was in flight. **Every path out of the drain moves
+  `CAPR`.** That is the real invariant, and the first version of this check broke
+  it: it stopped the drain without moving the read offset, so one over-long frame
+  parked the driver on the same unreadable header forever and every later packet,
+  valid or not, was silently lost. A review found it by injecting one 1600-byte
+  frame. Trading a memory fault for a permanent silence is not a fix; it is the
+  same denial of service, harder to notice.
+- **A frame shorter than the Ethernet minimum is padded, with zeroes.** The card
+  does not pad for us, and a 42-byte ARP reply sent as 42 bytes is a runt a real
+  switch would drop. The padding is explicitly zeroed rather than left as
+  whatever the previous frame put in that buffer — padding with stale bytes is
+  how a driver leaks the contents of old packets to everyone on the segment.
+- **Every multi-byte field crossing the wire is converted, and byte arrays never
+  are.** ARP's hardware type, protocol type, opcode and addresses, and IPv4's
+  lengths, identification, flags and addresses, go through `htons`/`htonl`
+  outbound and `ntohs`/`ntohl` inbound; an address copied from a request into
+  its reply stays in network order and is never swapped there and back; MAC addresses are
+  `uint8_t[6]` and are copied as bytes, because an array has no endianness. The
+  trap this avoids is comparing a raw wire field against a host-order constant,
+  which does not fail loudly — it simply never matches, and looks exactly like a
+  network that is not asking.
+- **A transmit error path must end with the card and the driver agreeing where
+  they are.** The RTL8139 transmits its descriptors strictly in order, so a
+  descriptor that never comes back cannot be skipped — the card would still be
+  waiting on it, and every later frame would be reported sent and never leave.
+  A timeout flags the transmitter; the interrupt loop resets the card after the
+  receive drain and before unmasking the line, and the driver's index goes back
+  to 0 with the card's. It is the transmit-side twin of the receive rule that
+  every exit from the drain moves `CAPR`, and the first version broke it the same
+  way: by returning without moving anything.
+- **A driver answers only for the address it owns.** An ARP request whose target
+  is not `10.0.2.15` gets no reply. Answering for addresses you do not hold is
+  how a machine hijacks traffic on a segment, and the check that prevents it is
+  one comparison, in host order on both sides.
+- **A checksum is verified on the way in and computed with its field zeroed on
+  the way out.** A received IPv4 header, ICMP message and UDP segment are summed
+  as they arrived, checksum included — UDP's with its pseudo-header in front —
+  and must come to zero; anything else is dropped without a word. The one
+  exception is a UDP checksum of 0, which RFC 768 lets a sender use to mean
+  "none" and which is accepted unverified (RFC 1122 4.1.3.4 allows it). Going
+  out, UDP is always checksummed, and a checksum that comes out as 0 is sent as
+  `0xFFFF` — the other zero of one's complement — so it is never mistaken for
+  "none". An outgoing one is summed with its checksum field set to zero
+  first, because the checksum is defined over the header as if that field were
+  zero — computing it with the old value still there sums garbage in. The outbound side is re-checked by an implementation this project
+  did not write: `tcpdump` reads every frame the guest sent during `make ping`
+  and `make udp` and checks each checksum, and the UDP gate counts a missing
+  checksum as a failure. The inbound side — that the guest refuses what it
+  should — is tested by requests with deliberately wrong checksums, built with
+  the tools' own RFC-derived reference.
+- **A reply goes only to a single, ordinary unicast host.** The
+  card is promiscuous, so frames for the whole segment arrive; only those sent
+  to this card's MAC or to broadcast are handed above layer 2, and IPv4 then
+  insists on this machine's own MAC and address. A request from a broadcast, multicast, loopback, reserved source, anything in
+  0.0.0.0/8, the subnet's own address, or this machine's own address is dropped:
+  RFC 1122 requires it, and the reply would be a datagram no host may send.
+  Fan-out on the segment is prevented by a different check — a source MAC that
+  is a group address is refused — because the reply's Ethernet destination is
+  the request's source MAC, never derived from the IP address. What no check
+  here can stop is a request forged from another host's ordinary address, which
+  draws a reply to that host, as it would from any machine that answers ping. Only an echo request is
+  answered, never an echo reply, so two hosts cannot bounce ICMP replies forever.
+  UDP echo has no such marker — a reply looks exactly like a request — so it
+  refuses source ports below 1024, where the services that also answer
+  everything live, and 2049, NFS, which trusts a client by its port. That stops
+  echo-to-echo and echo-to-chargen loops, and stops the echo delivering chosen
+  bytes to a service port or to NFS. It governs only where an echo goes: every
+  echo still leaves from port 7, a privileged port, so it does not stop chosen
+  bytes reaching some other service that trusts a privileged source port, nor a
+  loop with a reflector on an ordinary high port (see Known limitations).
 
 ## Known limitations
 
 These are deliberate boundaries, not oversights:
 
+- **Spurious IRQ 7/15 are not detected** via the in-service register. Not
+  reachable while those lines stay masked.
+- **A line is unmasked only when something owns it.** IRQ0 (timer) and IRQ1
+  (keyboard) at boot, and any line a driver claims at run time with
+  `sys_claim_irq` (the network card takes IRQ11, which also opens the cascade);
+  every other line stays masked, and installing a handler is what opens one. A
+  forwarded line — IRQ1, or a claimed one — is closed by the kernel each time it
+  fires and reopened by the driver, and left masked for good if that driver dies.
 - **No virtual memory allocator.** `map_page` maps a frame at an address you
   choose; there is nothing that picks addresses for you, and no unmapping.
 - **The identity map starts at `0x0`**, so a null-pointer dereference does not
@@ -470,17 +1135,6 @@ These are deliberate boundaries, not oversights:
   than faulting, and the window grows to cover what the allocator has already
   used — but recursive mapping or a higher-half kernel is what removes the
   constraint properly.
-- **`pmm_free_block` cannot tell one holder's reference from another's.** It
-  does know a reserved frame from an allocated one — reserved memory is pinned
-  and a free of it is ignored — but it takes any caller's word that the
-  reference being dropped is theirs, so a double free releases someone else's
-  hold on a frame that is still mapped.
-- **Keyboard is make codes only** — no shift, caps lock, modifiers, or extended
-  (`0xE0`) keys.
-- **Spurious IRQ 7/15 are not detected** via the in-service register. Not
-  reachable while those lines stay masked.
-- **Only IRQ0 and IRQ1 are unmasked.** Every other line stays masked, and a
-  handler is what opens one.
 - **The heap is a fixed 1 MiB and never grows.** `kmalloc` returns `NULL` once
   it is full; freed pages are not returned to the physical allocator.
 - **First fit is O(n) in the number of blocks**, and there is no free list, so a
@@ -489,26 +1143,27 @@ These are deliberate boundaries, not oversights:
   writing, no creation or deletion. `readdir` returns a pointer to a single
   shared `dirent`, which is safe only while the kernel is single-threaded.
 - **Only one filesystem can be mounted**, at `/`. There is no mount table.
-- **The mutex has no timeout, no owner and no recursion.** Locking twice from
-  the same process deadlocks it against itself, a process that dies holding the
-  lock leaves it held forever with no way to break it, and there is no priority
-  inheritance because there are no priorities.
-- **A shared segment has exactly two possible holders.** The creator names one
-  peer at creation, and no third process may attach however it comes by the id —
-  which is the fix for a real hole, since ids are sequential and were previously
-  checked only for existence. Sharing among three or more would need a grantee
-  set rather than a single peer.
-- **A shared segment is exactly one page.** There is no multi-page segment, no
-  resize, and no explicit detach — a mapping lasts until the process dies.
-- **The shared-memory window is a bump allocator.** Addresses are handed out
-  forward and never reclaimed, which is what makes an attach unable to land on
-  something already mapped, at the cost of a process that attaches repeatedly
-  eventually exhausting its window.
-- **The registry is a fixed 16 entries** and any process may fill it. There is
-  no quota, so a hostile program can deny shared memory to everyone else.
-- **Reaping only runs when the machine goes idle.** A dead process's memory is
-  held until the scheduler has nothing else to do, which is immediate here and
-  would not be under sustained load.
+- **IPC is single-slot and untimed.** A mailbox holds one unread message; a
+  second `send` returns `IPC_ERR_FULL` rather than queueing, and `recv` blocks
+  with no timeout. Pids are assigned in creation order, never reused, and the
+  demo hardcodes the receiver's.
+- **The loader is eager and non-relocating.** The whole image is read into the
+  heap and copied into frames up front: no demand paging, no `mmap`, and no
+  page cache. Only `ET_EXEC` is accepted, so there is no relocation
+  processing, no dynamic linking, and no interpreter.
+- **A process's frames must be identity-mapped.** The kernel fills them by
+  physical address, so an image large enough to push the allocator past the
+  identity window fails to load rather than falling back to a temporary
+  mapping.
+- **No `exec`, no `fork`, and no arguments.** A process is created by the
+  kernel at boot or by `sys_spawn` from the shell; it gets no `argv` or
+  environment, and cannot replace its own image. `sys_exit` ends it and
+  `sys_waitpid` reaps it; its pid is never reused.
+- **A page directory created after a process exists would not reach it.**
+  Address spaces share the kernel's page tables, so mappings added inside an
+  existing table propagate everywhere, but a brand-new kernel directory entry
+  would appear only in the kernel's own directory. Nothing creates one after
+  boot today.
 - **The filesystem has no timeouts and no recovery.** If the VFS server dies,
   every client blocks in `recv` forever: there is no supervisor, no restart, and
   no way for a client to notice. A real microkernel earns its keep by
@@ -530,31 +1185,195 @@ These are deliberate boundaries, not oversights:
 - **A filename must fit one message.** Requests carry a fixed 32-byte payload,
   so a name longer than 31 bytes cannot be expressed. The server refuses such a
   request rather than truncating it into a lookup for a different file.
-- **The loader is eager and non-relocating.** The whole image is read into the
-  heap and copied into frames up front: no demand paging, no `mmap`, and no
-  page cache. Only `ET_EXEC` is accepted, so there is no relocation
-  processing, no dynamic linking, and no interpreter.
-- **A process's frames must be identity-mapped.** The kernel fills them by
-  physical address, so an image large enough to push the allocator past the
-  identity window fails to load rather than falling back to a temporary
-  mapping.
-- **No `exec`, no `fork`, no `exit`, and no arguments.** A process is created
-  by the kernel at boot, gets no `argv` or environment, and cannot start
-  another. It is reclaimed when it dies, but only by the idle task, and its
-  pid is never reused.
-- **A page directory created after a process exists would not reach it.**
-  Address spaces share the kernel's page tables, so mappings added inside an
-  existing table propagate everywhere, but a brand-new kernel directory entry
-  would appear only in the kernel's own directory. Nothing creates one after
-  boot today.
-- **IPC is single-slot and untimed.** A mailbox holds one unread message; a
-  second `send` returns `IPC_ERR_FULL` rather than queueing, and `recv` blocks
-  with no timeout. Pids are assigned in creation order, never reused, and the
-  demo hardcodes the receiver's.
-- **Reaping is all-or-nothing, and only at idle.** A dead process is torn down
-  completely — address space, kernel stack, control block, and one reference on
-  every frame it mapped — but only once the scheduler has nothing else to run.
-  Its pid is never reused.
+- **`pmm_free_block` cannot tell one holder's reference from another's.** It
+  does know a reserved frame from an allocated one — reserved memory is pinned
+  and a free of it is ignored — but it takes any caller's word that the
+  reference being dropped is theirs, so a double free releases someone else's
+  hold on a frame that is still mapped.
+- **A shared segment has exactly two possible holders.** The creator names one
+  peer at creation, and no third process may attach however it comes by the id —
+  which is the fix for a real hole, since ids are sequential and were previously
+  checked only for existence. Sharing among three or more would need a grantee
+  set rather than a single peer.
+- **A shared segment is at most sixteen pages and stays the size it was
+  created.** There is no resize and no explicit detach — a mapping lasts until
+  the process dies.
+- **The shared-memory window is a bump allocator.** Addresses are handed out
+  forward and never reclaimed, which is what makes an attach unable to land on
+  something already mapped, at the cost of a process that attaches repeatedly
+  eventually exhausting its window.
+- **The registry is a fixed 16 entries** and any process may fill it. There is
+  no quota, so a hostile program can deny shared memory to everyone else.
+- **The mutex has no timeout, no owner and no recursion.** Locking twice from
+  the same process deadlocks it against itself, a process that dies holding the
+  lock leaves it held forever with no way to break it, and there is no priority
+  inheritance because there are no priorities.
+- **The keyboard driver knows shift and nothing else** — no caps lock, control,
+  alt, or extended (`0xE0`) keys. Extended keys are recognised by their prefix
+  and dropped whole, because their second byte reuses ordinary values: keypad
+  Enter's is Enter's, and a review caught it printing a newline.
+- **IOPL is all or nothing.** `sys_grant_io` hands the driver every I/O port
+  on the machine and `cli`/`sti` with them, because that is what IOPL=3 means.
+  Per-port granularity is what the TSS I/O permission bitmap is for, and it is
+  not used here.
+- **One driver per interrupt line, and nothing restarts one.** When the driver
+  dies the kernel takes its line back at the moment of death — drains the
+  controller, reopens the line — so every later keystroke is reported as
+  dropped instead of wedging the 8042, but nobody decodes it. A supervisor
+  that restarted the driver is what a real microkernel would have here.
+- **A forwarded interrupt has no timeout.** The line stays masked until the
+  driver calls `sys_unmask_irq`; a driver that never does leaves the device
+  silent forever.
+- **Focus is one process, and Tab is the only way to move it.** There is no
+  focus request, no unsubscribe, and Tab itself can never reach an
+  application. Rotation is subscription order.
+- **A dead subscriber costs one keystroke.** Death is noticed only when the
+  server next sends to it: the key that would have gone to the corpse is
+  dropped, or the Tab that would have focused it moves on. There is no
+  notification a process could act on sooner.
+- **A slow application loses keys rather than queueing them.** Its mailbox
+  holds one message; the server retries eight yields and then drops. There is
+  no per-application queue.
+- **Eight subscribers.** The table is fixed and any process may fill it.
+- **Only the keystroke path is protected from flooding.** A subscription is an
+  ordinary send, so a process flooding the input server can delay or deny an
+  application's subscribe handshake; everything that is not the trusted sender
+  still competes for one slot with no fairness.
+- **Four terminals, no scrollback, no way to give one back.** A process gets a
+  terminal the first time it is focused and keeps it for life; the fourth such
+  process finds none free and shares the system console. Each terminal holds one screen.
+- **The console holds a partial line until its newline.** A prompt printed
+  without one by a process on the shared console does not appear until the
+  line completes or reaches 80 characters. A process's own terminal is not
+  buffered.
+- **The kernel log is shown when the console server wakes**, at startup and
+  after every message it handles. A line the kernel logs while nobody is
+  printing or typing waits on the console until something is.
+- **The console server dying silences the machine.** Every print becomes
+  `IPC_ERR_NO_TASK` and is dropped; the kernel keeps logging to a buffer nobody
+  reads. A panic still reaches the screen, over whatever was showing.
+- **Output is not flood-proof.** Only the input server's switch requests hold
+  the console's reserved slot; every process's characters contend for the
+  ordinary one, so a process looping a send at the console delays or starves
+  everyone else's output — the same single-slot weakness the keystroke path
+  had before its reserved slot, and the reason a per-sender queue is the real
+  fix.
+- **Output is at most 31 characters per message.** A longer line can be split
+  by another writer on the same terminal at a chunk boundary; the shared
+  console is additionally line-buffered per sender, an owned terminal is not.
+- **One load segment, reused.** The shell keeps a sixteen-page segment for the
+  life of the machine and the VFS server keeps it attached; neither can give
+  it back, because there is no detach. Programs larger than 64 KiB are refused.
+- **Sixteen processes, ever at once.** The cap counts the five servers (VFS,
+  keyboard, input, console, network) and the shell, so ten more programs can be
+  alive at a time. Pids are never reused, so the count of pids ever handed out
+  is unbounded; the count alive is not.
+- **The retired boot demos are built but not started.** The client, the
+  shared-memory pair and the mutex pair address each other by pids that only
+  creation order at boot ever made true; `client.elf` is in the image and can
+  be run from the shell, the others are not.
+- **Reaping runs once per tick.** A dead process's memory is held for at most
+  one timer period, ten milliseconds, whatever else is running.
+- **A spawned program receives no arguments and no stdin, only an exit
+  status.** The shell waits for each command and prints a line if it exited
+  non-zero (a fault shows as a status at or above `0x100`). There is no
+  backgrounding: a program that never exits blocks the shell until it does, and
+  there is no way to interrupt or kill it.
+- **Keys typed while a command runs are lost.** The shell blocks inside
+  `sys_waitpid` for the whole life of the command, so it is not in `recv` to
+  drain its mailbox; its one reserved input slot holds the first such key and
+  the input server drops the rest. This is invisible for a program like
+  `calc.elf` that exits in microseconds, and inherent to a synchronous wait
+  with a single-slot mailbox — a request queue, or a shell that polled
+  `waitpid` while still reading keys, is what would keep type-ahead.
+- **A long-lived parent that never waits leaks its children's zombies** until
+  it dies, at which point they become orphans and the tick reaper takes them.
+  The shell waits on every child, so it never accumulates any; a hand-written
+  parent that spawns and ignores its children is the case this describes.
+- **One card, the first one found.** The PCI scan stops at the first RTL8139
+  and a second would be ignored; multi-function and bridged devices past bus 7
+  are not walked at all.
+- **A literal zero-length frame cannot be tested honestly over a socket netdev.**
+  Writing a 4-byte length prefix of zero does not put one empty frame on the
+  wire; QEMU's socket backend turns it into a few hundred zero-length receive
+  records. The driver rides it out — each is reported as too short, the ring
+  advances, and normal frames resume immediately afterwards, with one frame lost
+  inside the storm — but the multiplication is the backend's, not the card's, so
+  this says nothing about what real hardware would do. Nonzero runts (8 bytes,
+  what `tools/inject_frames.py` sends) behave exactly once each.
+- **Transmission is four descriptors and no queue.** The card has exactly four
+  and works through them strictly in order. When the next one has not come back
+  the driver spins briefly and then drops the frame rather than blocking,
+  because sending happens on the interrupt path. There is no software queue
+  behind them and no retry.
+- **A stuck transmitter costs a card reset.** Recovery from a descriptor that
+  never completes is a full reset of the card, because only a reset puts the
+  card's own transmit pointer back in step with the driver's. The reset also
+  clears the receive ring, so frames waiting in it are lost, along with the
+  frame whose send timed out. QEMU never gets here on its own; the path was
+  exercised by desynchronising the card's pointer from the monitor.
+- **ARP answers, but remembers nothing.** There is no ARP cache: a reply is
+  built, sent and forgotten. The IP layer above it only ever replies, and a
+  reply goes to the source MAC of the frame that asked, so nothing looks an
+  address up — which also means no datagram this machine originates could find
+  its way anywhere yet. The machine's IP address is a compile-time constant
+  (`10.0.2.15`) because there is no DHCP client to learn one, and it answers for
+  that single address only.
+- **IPv4 is receive-and-reply only.** No fragment is reassembled — one is dropped,
+  which RFC 1122 does not allow a host but which is honest about there being no
+  reassembly buffer. Options are accepted and stepped over but not returned:
+  RFC 1122 asks for Record Route and Timestamp to be updated in an echo reply and
+  a source route to be reversed, and this one sends a plain 20-byte header
+  instead. Nothing is routed, and no datagram is originated except a reply.
+- **ICMP is echo and nothing else.** Only echo requests are answered; every other
+  type is logged and ignored, and no ICMP error — destination unreachable,
+  parameter problem — is ever generated, so a malformed datagram is dropped
+  without telling the sender why.
+- **Nothing above IPv4 but ICMP echo and UDP echo.** No TCP: a datagram for any
+  other protocol passes every IPv4 check and is then reported as something
+  nothing here speaks. The CRC the card appends is subtracted from the length
+  and otherwise ignored. No other process can receive a frame or a datagram
+  either — there is no socket interface, so the network server is the only thing
+  on this system that knows the card exists, and the echo service lives inside
+  it rather than in a program of its own.
+- **With the console on screen, a flood slows the network to a crawl.** Every
+  received frame is logged to the console, and while terminal 0 is showing,
+  each line that scrolls it redraws the whole screen. The network server waits
+  for that on every frame, so a host flooding at a few hundred frames a second
+  pushes everyone else's ping replies out to about two seconds. With the shell
+  in focus, as at boot, the same flood is answered in full. The logging is
+  deliberate, for a system whose point is to be watched.
+- **The host's own `ping` cannot reach the guest.** QEMU's user-mode network is
+  NAT and forwards no ICMP inward, and a TAP device the host could route through
+  needs root. `make ping` plays the host over a socket netdev instead; it proves
+  the guest's replies, not the host's routing. UDP does reach it, but only
+  through the port forward — `nc -u 127.0.0.1 7007`, never `10.0.2.15` — and
+  `make qemu` now fails to start if that port is taken.
+- **UDP has one service, and no way to say a port is closed.** A datagram to any
+  port but 7 is logged and dropped; RFC 1122 says a host SHOULD answer it with
+  an ICMP port-unreachable, and none is generated. Every RFC 1122 MUST about
+  the application interface is unmet, for want of an application to deliver
+  to: IP options are not passed up with a datagram nor settable on one sent
+  (4.1.3.2), ICMP errors are not passed to UDP (4.1.3.3), the destination
+  address a datagram arrived on is not passed up and no application chooses a
+  source address (4.1.3.5), and nothing can set TTL, TOS or options (4.1.4).
+- **A loop through a high-port reflector is not prevented.** The source-port
+  rule stops echo answering another well-known service, but a request forged to
+  come from a second echo on an ordinary port — another machine's — would be
+  answered, and answered again, for as long as both keep going. Under `make
+  qemu` the forward itself can be that reflector: QEMU's user-mode stack sets
+  `SO_REUSEADDR` on the forward's socket, so any local process can share
+  127.0.0.1:7007, and one datagram it sends from there reaches the guest as
+  10.0.2.2:7007, whose echo QEMU hands straight back to the guest — a loop of
+  a few thousand frames a second that runs until QEMU exits, with the sender
+  long gone. The usual remedy is a rate limit, and there is no clock in ring 3
+  to build one on.
+- **Every echo comes from a privileged port.** The echo always leaves from port
+  7, carrying bytes the sender chose, to any unicast address a forged request
+  names and any port but those below 1024 and 2049. A service on an ordinary
+  port that trusts a client for sending from a privileged port can therefore
+  still be handed chosen bytes. OpenBSD's inetd, whose rule this is, has the
+  same exposure; the remedy is not to run echo where such services listen.
 
 ## License
 

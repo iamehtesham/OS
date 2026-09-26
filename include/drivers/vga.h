@@ -4,43 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Dimensions of the standard VGA colour text mode (mode 3), which is the state
- * the BIOS/bootloader leaves the adapter in when we are handed control. */
-#define VGA_WIDTH  80
-#define VGA_HEIGHT 25
+#include "arch/vga.h"
 
-/* The 4-bit palette hardwired into VGA text mode. Backgrounds only use the low
- * 3 bits: bit 3 of the high nibble is the blink attribute, not intensity. */
-enum vga_color {
-    VGA_COLOR_BLACK         = 0,
-    VGA_COLOR_BLUE          = 1,
-    VGA_COLOR_GREEN         = 2,
-    VGA_COLOR_CYAN          = 3,
-    VGA_COLOR_RED           = 4,
-    VGA_COLOR_MAGENTA       = 5,
-    VGA_COLOR_BROWN         = 6,
-    VGA_COLOR_LIGHT_GREY    = 7,
-    VGA_COLOR_DARK_GREY     = 8,
-    VGA_COLOR_LIGHT_BLUE    = 9,
-    VGA_COLOR_LIGHT_GREEN   = 10,
-    VGA_COLOR_LIGHT_CYAN    = 11,
-    VGA_COLOR_LIGHT_RED     = 12,
-    VGA_COLOR_LIGHT_MAGENTA = 13,
-    VGA_COLOR_LIGHT_BROWN   = 14,
-    VGA_COLOR_WHITE         = 15,
-};
-
-/* Attribute byte layout: background in the high nibble, foreground in the low. */
-static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg)
-{
-    return (uint8_t)((uint8_t)fg | (uint8_t)((uint8_t)bg << 4));
-}
-
-/* A text-mode cell is 16 bits little-endian: codepoint then attribute. */
-static inline uint16_t vga_entry(unsigned char c, uint8_t color)
-{
-    return (uint16_t)((uint16_t)c | ((uint16_t)color << 8));
-}
+/* The kernel's own text driver. It clears the screen once at boot and is
+ * otherwise used by exactly one caller: panic. Ordinary output goes to the
+ * kernel log and is shown by the ring-3 console server, which maps the same
+ * buffer this driver writes to and owns it from then on. */
 
 void vga_init(void);
 void vga_clear(void);

@@ -50,6 +50,20 @@ void *pmm_alloc_block(void);
  * and pinned frames, so a double free cannot corrupt the counters. */
 void pmm_free_block(void *addr);
 
+/* Allocates `count` PHYSICALLY CONTIGUOUS frames and returns the base address,
+ * or NULL if no run that long is free. Each frame starts with a single
+ * reference, like pmm_alloc_block; a DMA caller pins them (pmm_pin) once the
+ * mapping is in place, since a device keeps a physical pointer the kernel
+ * cannot revoke and the frames must not be reclaimed under it. */
+void *pmm_alloc_contiguous(uint32_t count);
+
+/* Pins a live frame: marks it PMM_PINNED so no reference count ever frees it.
+ * For a DMA buffer, whose frames a device may write after its driver has died
+ * -- the pin is what stops those frames from being handed to another process
+ * that the device would then corrupt. The cost is that the buffer is never
+ * reclaimed; a driver that restarts leaks it. */
+void pmm_pin(void *addr);
+
 /* Takes one more reference to an already-allocated frame, for a second address
  * space mapping it. Returns false if the frame is free (referencing nothing) or
  * already at the maximum -- a count that wrapped to zero would free a frame

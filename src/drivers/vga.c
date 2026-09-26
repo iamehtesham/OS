@@ -9,19 +9,16 @@
 /* Colour text mode maps the character grid straight onto physical memory here;
  * stores land on screen with no driver handshake. volatile keeps the compiler
  * from eliding writes it can see are never read back. */
-static volatile uint16_t *const vga_buffer = (volatile uint16_t *)0xB8000;
+static volatile uint16_t *const vga_buffer = (volatile uint16_t *)VGA_TEXT_BUFFER_PHYS;
 
-/* CRTC index/data register pair: a write to CRTC_INDEX selects which internal
- * CRTC register CRTC_DATA then reads or writes. This is the colour-adapter
- * pair; a monochrome adapter would answer at 0x3B4/0x3B5 instead. */
-#define CRTC_INDEX 0x3D4
-#define CRTC_DATA  0x3D5
-
-/* CRTC registers backing the text cursor. */
-#define CRTC_CURSOR_START    0x0A  /* bits 0-4 top scanline, bit 5 disables the cursor */
-#define CRTC_CURSOR_END      0x0B  /* bits 0-4 bottom scanline */
-#define CRTC_CURSOR_LOC_HIGH 0x0E
-#define CRTC_CURSOR_LOC_LOW  0x0F
+/* The register numbers live in arch/vga.h, shared with the ring-3 console
+ * server that drives the same cursor. */
+#define CRTC_INDEX           VGA_CRTC_INDEX
+#define CRTC_DATA            VGA_CRTC_DATA
+#define CRTC_CURSOR_START    VGA_CRTC_CURSOR_START
+#define CRTC_CURSOR_END      VGA_CRTC_CURSOR_END
+#define CRTC_CURSOR_LOC_HIGH VGA_CRTC_CURSOR_LOC_HIGH
+#define CRTC_CURSOR_LOC_LOW  VGA_CRTC_CURSOR_LOC_LOW
 
 /* Character cells are 16 scanlines tall in mode 3, so the bottom two rows give
  * the conventional underline cursor. */

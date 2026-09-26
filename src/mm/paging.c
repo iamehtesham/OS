@@ -4,7 +4,7 @@
 
 #include "mm/paging.h"
 #include "mm/pmm.h"
-#include "utils/stdio.h"
+#include "utils/klog.h"
 
 /* Both levels are plain arrays of 1024 32-bit entries, which is exactly one
  * 4 KiB frame. That is why pmm_alloc_block can back them directly: its
@@ -283,12 +283,73 @@ void paging_destroy_address_space(uint32_t directory_phys)
     pmm_free_block(dir);
 }
 
+void paging_release_user_space(uint32_t directory_phys)
+{
+    if (directory_phys == 0 || page_directory == NULL || directory_phys == page_directory_phys) {
+        return;
+    }
+
+    page_entry_t *const dir = (page_entry_t *)(uintptr_t)directory_phys;
+
+    for (uint32_t i = 0; i < PAGE_DIRECTORY_ENTRIES; i++) {
+        if ((dir[i] & PAGE_PRESENT) == 0) {
+            continue;
+        }
+
+        /* A table shared with the kernel holds no user pages of this process,
+         * and its frames are the kernel's -- skip it exactly as the full
+         * teardown does. Only the process's own tables map user memory. */
+        if ((dir[i] & PAGE_FRAME_MASK) == (page_directory[i] & PAGE_FRAME_MASK)) {
+            continue;
+        }
+
+        page_entry_t *const table = (page_entry_t *)(uintptr_t)(dir[i] & PAGE_FRAME_MASK);
+
+        for (uint32_t j = 0; j < PAGE_TABLE_ENTRIES; j++) {
+            if ((table[j] & PAGE_PRESENT) != 0) {
+                pmm_free_block((void *)(uintptr_t)(table[j] & PAGE_FRAME_MASK));
+                /* Cleared so the frame cannot be freed a second time -- neither
+                 * a re-entry here nor paging_free_pagetables walks a live PTE
+                 * for it again. This also unmaps the page, which is harmless:
+                 * nothing reads user memory between here and the context
+                 * switch that abandons this directory. */
+                table[j] = 0;
+            }
+        }
+    }
+}
+
+void paging_free_pagetables(uint32_t directory_phys)
+{
+    if (directory_phys == 0 || page_directory == NULL || directory_phys == page_directory_phys) {
+        return;
+    }
+
+    page_entry_t *const dir = (page_entry_t *)(uintptr_t)directory_phys;
+
+    for (uint32_t i = 0; i < PAGE_DIRECTORY_ENTRIES; i++) {
+        if ((dir[i] & PAGE_PRESENT) == 0) {
+            continue;
+        }
+
+        if ((dir[i] & PAGE_FRAME_MASK) == (page_directory[i] & PAGE_FRAME_MASK)) {
+            continue;
+        }
+
+        /* The table frame only. Its leaf pages were freed by
+         * paging_release_user_space, so this deliberately does not walk them. */
+        pmm_free_block((void *)(uintptr_t)(dir[i] & PAGE_FRAME_MASK));
+    }
+
+    pmm_free_block(dir);
+}
+
 void paging_init(uint32_t extra_reserve)
 {
     void *const dir_frame = pmm_alloc_block();
 
     if (dir_frame == NULL) {
-        kprintf("paging: no free frame for the page directory\n");
+        klog("paging: no free frame for the page directory\n");
         return;
     }
 
@@ -347,7 +408,7 @@ void paging_init(uint32_t extra_reserve)
 
         while (mapped < identity_limit) {
             if (!map_page(mapped, mapped, PAGE_WRITABLE)) {
-                kprintf("paging: identity map failed at 0x%x\n", mapped);
+                klog("paging: identity map failed at 0x%x\n", mapped);
                 page_directory = NULL;
                 return;
             }
@@ -360,7 +421,7 @@ void paging_init(uint32_t extra_reserve)
      * translation is on. Say so out loud rather than discovering it later as an
      * unexplained map_page failure. */
     if (pmm_highest_used_address() >= identity_limit) {
-        kprintf("paging: no reachable frames left below 0x%x\n", identity_limit);
+        klog("paging: no reachable frames left below 0x%x\n", identity_limit);
         page_directory = NULL;
         return;
     }
@@ -371,7 +432,7 @@ void paging_init(uint32_t extra_reserve)
     const uint32_t reachable_free = identity_limit - pmm_highest_used_address();
 
     if (reachable_free < extra_reserve) {
-        kprintf("paging: only %u KiB reachable below 0x%x, %u KiB wanted\n",
+        klog("paging: only %u KiB reachable below 0x%x, %u KiB wanted\n",
                 reachable_free / 1024u, identity_limit, extra_reserve / 1024u);
     }
 

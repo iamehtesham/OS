@@ -20,6 +20,7 @@
 #include "fs/initrd.h"
 #include "fs/vfs.h"
 #include "ipc/vfs_proto.h"
+#include "sys/syscall_abi.h"
 #include "user/ulib.h"
 
 /* How many times a reply will be retried before it is dropped.
@@ -142,6 +143,114 @@ static void handle_read(const ipc_message_t *msg)
     reply(msg->sender_pid, MSG_READ_REPLY, payload, sizeof(payload));
 }
 
+/* Segments this server has attached, so a client that reuses one segment for
+ * every load costs one attach, not one per load: each attach maps the segment
+ * again at a new address and takes another reference, and neither is ever
+ * given back. Sixteen is more clients than exist. */
+#define ATTACH_SLOTS 16u
+
+static struct sys_shm attached[ATTACH_SLOTS];
+static uint32_t       attached_count;
+
+/* Attaches once and remembers. The page count comes from the kernel, which is
+ * the only party a server may take a segment's size from: a client saying
+ * "sixteen pages" about a one-page segment would have this server write
+ * fifteen pages past the mapping and die of it. */
+static const struct sys_shm *attach_cached(uint32_t id)
+{
+    for (uint32_t i = 0; i < attached_count; i++) {
+        if (attached[i].id == id) {
+            return &attached[i];
+        }
+    }
+
+    struct sys_shm segment;
+
+    segment.id    = id;
+    segment.vaddr = 0;
+    segment.pages = 0;
+
+    if (!u_shm_attach_info(&segment)) {
+        return NULL;
+    }
+
+    if (attached_count < ATTACH_SLOTS) {
+        attached[attached_count] = segment;
+        return &attached[attached_count++];
+    }
+
+    /* Table full: serve this one from a temporary and forget the mapping. It
+     * still works; it just costs a window page and a reference per load. */
+    static struct sys_shm overflow;
+
+    overflow = segment;
+    return &overflow;
+}
+
+/* Copies a whole file to the start of a client's shared segment. What the
+ * client sends is an inode and an id; what the server trusts about the
+ * segment is only what the kernel told it on attach. */
+static void handle_load(const ipc_message_t *msg)
+{
+    if (fs_root == NULL) {
+        reply_error(msg->sender_pid, MSG_LOAD_FAIL, VFS_ERR_NOT_MOUNTED);
+        return;
+    }
+
+    const uint32_t   inode = u_load32(msg->data);
+    const uint32_t   id    = u_load32(msg->data + 4);
+    fs_node_t *const node  = initrd_node_by_inode(inode);
+
+    if (node == NULL) {
+        reply_error(msg->sender_pid, MSG_LOAD_FAIL, VFS_ERR_BAD_REQUEST);
+        return;
+    }
+
+    const struct sys_shm *const segment = attach_cached(id);
+
+    if (segment == NULL) {
+        /* Not ours to attach: the client did not create it or name us. */
+        reply_error(msg->sender_pid, MSG_LOAD_FAIL, VFS_ERR_NO_ACCESS);
+        return;
+    }
+
+    if (node->length > segment->pages * 4096u) {
+        reply_error(msg->sender_pid, MSG_LOAD_FAIL, VFS_ERR_TOO_BIG);
+        return;
+    }
+
+    const uint32_t copied =
+        vfs_read(node, 0, node->length, (uint8_t *)(uintptr_t)segment->vaddr);
+
+    uint8_t payload[4];
+
+    u_store32(payload, copied);
+    reply(msg->sender_pid, MSG_LOAD_REPLY, payload, sizeof(payload));
+}
+
+/* One directory entry per request; the client walks the index up until it
+ * is told the listing is over. Names longer than a payload are cut, which for
+ * a listing is the right failure. */
+static void handle_list(const ipc_message_t *msg)
+{
+    if (fs_root == NULL) {
+        reply(msg->sender_pid, MSG_LIST_END, NULL, 0);
+        return;
+    }
+
+    struct dirent *const entry = vfs_readdir(fs_root, u_load32(msg->data));
+
+    if (entry == NULL) {
+        reply(msg->sender_pid, MSG_LIST_END, NULL, 0);
+        return;
+    }
+
+    uint8_t payload[IPC_PAYLOAD_SIZE];
+
+    u_strncpy((char *)payload, entry->name, sizeof(payload));
+    reply(msg->sender_pid, MSG_LIST_REPLY, payload, sizeof(payload));
+}
+
 /* Maps the initrd and mounts it. Returns false if this process holds no grant,
  * which is what a client would see if it somehow ran this code. */
 static bool mount_initrd(void)
@@ -238,6 +347,14 @@ void _start(void)
 
         case MSG_READ:
             handle_read(&msg);
+            break;
+
+        case MSG_LOAD:
+            handle_load(&msg);
+            break;
+
+        case MSG_LIST:
+            handle_list(&msg);
             break;
 
         default:

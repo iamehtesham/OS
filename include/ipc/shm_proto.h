@@ -12,10 +12,11 @@
  * virtual addresses, and the messages exist only to name it and to say when
  * each side has finished writing. */
 
-/* Fixed by creation order, like the VFS server's. The reader is started first
+/* Fixed by creation order, like the VFS server's. The four core servers take
+ * pids 1-4 and the client 5; the reader is started next, before the writer,
  * so it is already blocked in recv when the writer sends. The kernel checks
  * this rather than assuming it. */
-#define SHM_READER_PID 3u
+#define SHM_READER_PID 6u
 
 #define MSG_SHM_OFFER 20u /* writer -> reader: data = { u32 shm id }  */
 #define MSG_SHM_REPLY 21u /* reader -> writer: the reply is in the page */

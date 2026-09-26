@@ -158,6 +158,68 @@ void *pmm_alloc_block(void)
     return (void *)(uintptr_t)((uint32_t)frame << PMM_BLOCK_SHIFT);
 }
 
+void *pmm_alloc_contiguous(uint32_t count)
+{
+    if (count == 0) {
+        return NULL;
+    }
+
+    /* First fit over RUNS, not over frames: a used frame resets the run, so
+     * only genuinely consecutive free frames accumulate to `count`. The
+     * ordinary allocator returns the first free frame with no regard for its
+     * neighbours, which is fine for a page table but useless for a device that
+     * DMAs across a contiguous physical buffer. O(total frames), run once when
+     * a driver sets up; nothing on the hot path calls it. */
+    uint32_t run_start = 0;
+    uint32_t run_len   = 0;
+
+    for (uint32_t frame = 0; frame < total_blocks; frame++) {
+        if (bit_test(frame)) {
+            run_len = 0; /* the run is broken; a used frame cannot be part of it */
+            continue;
+        }
+
+        if (run_len == 0) {
+            run_start = frame;
+        }
+
+        if (++run_len < count) {
+            continue;
+        }
+
+        /* A run of `count` free frames starting at run_start. Take them all,
+         * each with a single reference, exactly as pmm_alloc_block does for
+         * one -- the caller pins them once the mapping stands. */
+        for (uint32_t f = run_start; f < run_start + count; f++) {
+            bit_set(f);
+            frame_refs[f] = 1;
+            used_blocks++;
+        }
+
+        return (void *)(uintptr_t)((uint32_t)run_start << PMM_BLOCK_SHIFT);
+    }
+
+    /* No run that long exists. Physical memory is fragmented and there is no
+     * compaction -- a frame mapped into an address space cannot be moved -- so
+     * this is a real, reportable failure, not something to paper over. */
+    return NULL;
+}
+
+void pmm_pin(void *addr)
+{
+    if (addr == NULL) {
+        return;
+    }
+
+    const uint32_t frame = (uint32_t)(uintptr_t)addr >> PMM_BLOCK_SHIFT;
+
+    /* Only pin a live frame: pinning a free one would mark it permanently
+     * used while the allocator still believes it can hand it out. */
+    if (frame < total_blocks && bit_test(frame)) {
+        frame_refs[frame] = (uint8_t)PMM_PINNED;
+    }
+}
+
 void pmm_free_block(void *addr)
 {
     /* NULL is this allocator's out-of-memory sentinel, so freeing a failed

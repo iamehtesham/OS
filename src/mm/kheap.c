@@ -5,7 +5,7 @@
 #include "mm/kheap.h"
 #include "mm/paging.h"
 #include "mm/pmm.h"
-#include "utils/stdio.h"
+#include "utils/klog.h"
 
 #define HEADER_SIZE ((uint32_t)sizeof(struct kheap_block))
 
@@ -33,13 +33,13 @@ bool kheap_init(void)
         void *const frame = pmm_alloc_block();
 
         if (frame == NULL) {
-            kprintf("kheap: out of physical frames at offset 0x%x\n", offset);
+            klog("kheap: out of physical frames at offset 0x%x\n", offset);
             return false;
         }
 
         if (!map_page((uint32_t)(uintptr_t)frame, KHEAP_VIRTUAL_BASE + offset,
                       PAGE_WRITABLE)) {
-            kprintf("kheap: map_page failed at 0x%x\n", KHEAP_VIRTUAL_BASE + offset);
+            klog("kheap: map_page failed at 0x%x\n", KHEAP_VIRTUAL_BASE + offset);
             pmm_free_block(frame);
             return false;
         }
@@ -70,7 +70,7 @@ void *kmalloc(uint32_t size)
 
     for (struct kheap_block *block = heap_head; block != NULL; block = block->next) {
         if (block->magic != KHEAP_MAGIC) {
-            kprintf("kmalloc: corrupt header at %p\n", (void *)block);
+            klog("kmalloc: corrupt header at %p\n", (void *)block);
             return NULL;
         }
 
@@ -116,7 +116,7 @@ void kfree(void *ptr)
      * reporting one. */
     if (address < KHEAP_VIRTUAL_BASE + HEADER_SIZE ||
         address >= KHEAP_VIRTUAL_BASE + KHEAP_SIZE) {
-        kprintf("kfree: %p is not inside the heap\n", ptr);
+        klog("kfree: %p is not inside the heap\n", ptr);
         return;
     }
 
@@ -124,12 +124,12 @@ void kfree(void *ptr)
         (struct kheap_block *)((uint8_t *)ptr - HEADER_SIZE);
 
     if (block->magic != KHEAP_MAGIC) {
-        kprintf("kfree: %p has no valid header\n", ptr);
+        klog("kfree: %p has no valid header\n", ptr);
         return;
     }
 
     if (block->is_free) {
-        kprintf("kfree: %p freed twice\n", ptr);
+        klog("kfree: %p freed twice\n", ptr);
         return;
     }
 
@@ -158,7 +158,7 @@ void kfree(void *ptr)
     }
 
     if (!found) {
-        kprintf("kfree: %p is not a live block\n", ptr);
+        klog("kfree: %p is not a live block\n", ptr);
         return;
     }
 

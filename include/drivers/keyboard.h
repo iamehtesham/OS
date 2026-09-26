@@ -1,15 +1,18 @@
 #ifndef DRIVERS_KEYBOARD_H
 #define DRIVERS_KEYBOARD_H
 
-/* PS/2 controller registers. 0x60 carries scancodes out and commands in; 0x64
- * is the status register on read and the command register on write. */
-#define PS2_DATA_PORT   0x60
-#define PS2_STATUS_PORT 0x64
+#include <stdint.h>
 
-/* Status bit 0: a byte is waiting in the controller's output buffer. */
-#define PS2_STATUS_OUTPUT_FULL 0x01
+/* The kernel half of the keyboard. There is no scancode table here any more:
+ * the kernel drains the controller once at boot, and from then on IRQ1 is
+ * handed to the ring-3 driver the kernel routed it to. What remains is the
+ * fallback for when no such driver is alive. */
 
 /* Registers the IRQ1 handler and unmasks the line. Call after pic_init. */
 void keyboard_init(void);
+
+/* Scancodes the kernel had to read and throw away because no ring-3 driver
+ * was there to take them. Zero on a healthy system. */
+uint32_t keyboard_dropped(void);
 
 #endif /* DRIVERS_KEYBOARD_H */

@@ -15,6 +15,18 @@
  * band, in CR2 rather than in the interrupt frame. */
 #define ISR_PAGE_FAULT 14
 
+/* EFLAGS bits this kernel reads or writes in a saved frame (SDM Vol. 3A, 2.3).
+ *
+ * IOPL is the two-bit field at 13:12; IF is bit 9, right beside it. Raising
+ * IOPL to 3 is `eflags |= EFLAGS_IOPL_MASK`: every bit of the mask outside
+ * 13:12 is zero, so the OR leaves IF and every arithmetic flag exactly as the
+ * task left them, and since 3 is the maximum both bits go to 1 regardless of
+ * what they held, so no clear-then-set is needed. Assigning the mask instead of
+ * ORing it would zero IF and resume the task with interrupts off, never to be
+ * preempted again. */
+#define EFLAGS_IF        (1u << 9)
+#define EFLAGS_IOPL_MASK (3u << 12)
+
 /* Page fault error code bits (Intel SDM Vol. 3A, section 4.7). */
 #define PAGE_FAULT_PROTECTION (1u << 0) /* clear means the page was not present */
 #define PAGE_FAULT_WRITE      (1u << 1) /* clear means the access was a read    */

@@ -6,6 +6,10 @@ build/
 # recorded now live in README.md.
 NOTES.md
 
+# Byte-code left behind when a test harness imports tools/inject_frames.py for
+# its frame definitions rather than keeping a second copy of them.
+__pycache__/
+
 # Editor and OS noise
 *.swp
 *~

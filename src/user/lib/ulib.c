@@ -4,15 +4,6 @@
  * arguments. The memory clobber stops GCC caching anything across a call the
  * kernel may read from or write to. */
 
-int32_t u_print(const char *text)
-{
-    int32_t result;
-
-    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_PRINT), "b"(text) : "memory");
-
-    return result;
-}
-
 int32_t u_send(uint32_t target_pid, const ipc_message_t *msg)
 {
     int32_t result;
@@ -62,25 +53,153 @@ bool u_grant_info(struct sys_grant *out)
     return result == 0;
 }
 
-bool u_shm_map(struct sys_shm *out, uint32_t peer_pid)
+bool u_shm_map_pages(struct sys_shm *out, uint32_t peer_pid, uint32_t pages)
 {
     int32_t result;
 
+    /* edx carries the page count. Always set, even by the one-page wrapper
+     * below: the kernel reads the register, and a register nobody wrote holds
+     * whatever the last thing to use it left there. */
     __asm__ volatile ("int $0x80"
                       : "=a"(result)
-                      : "a"(SYS_SHM_MAP), "b"(out), "c"(peer_pid)
+                      : "a"(SYS_SHM_MAP), "b"(out), "c"(peer_pid), "d"(pages)
                       : "memory");
+
+    return result == 0;
+}
+
+bool u_shm_map(struct sys_shm *out, uint32_t peer_pid)
+{
+    return u_shm_map_pages(out, peer_pid, 1u);
+}
+
+bool u_shm_attach_info(struct sys_shm *segment)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_SHM_ATTACH), "b"(segment) : "memory");
 
     return result == 0;
 }
 
 uint32_t u_shm_attach(uint32_t id)
 {
-    uint32_t result;
+    struct sys_shm segment;
 
-    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_SHM_ATTACH), "b"(id) : "memory");
+    segment.id    = id;
+    segment.vaddr = 0;
+    segment.pages = 0;
+
+    return u_shm_attach_info(&segment) ? segment.vaddr : 0;
+}
+
+int32_t u_spawn(uint32_t shm_id, uint32_t length)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80"
+                      : "=a"(result)
+                      : "a"(SYS_SPAWN), "b"(shm_id), "c"(length)
+                      : "memory");
 
     return result;
+}
+
+uint32_t u_parent_of(uint32_t pid)
+{
+    uint32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_PARENT_OF), "b"(pid) : "memory");
+
+    return result;
+}
+
+void u_exit(int32_t status)
+{
+    for (;;) {
+        __asm__ volatile ("int $0x80" : : "a"(SYS_EXIT), "b"(status) : "memory");
+    }
+}
+
+int32_t u_waitpid(uint32_t pid, int32_t *status)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80"
+                      : "=a"(result)
+                      : "a"(SYS_WAITPID), "b"(pid), "c"(status)
+                      : "memory");
+
+    return result;
+}
+
+bool u_grant_io(void)
+{
+    int32_t result;
+
+    /* The kernel edits the EFLAGS image on its own stack; the iret that ends
+     * this instruction is what loads it. So the very next instruction after
+     * this one already runs with the new IOPL. */
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_GRANT_IO) : "memory");
+
+    return result == 0;
+}
+
+bool u_unmask_irq(uint32_t irq)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_UNMASK_IRQ), "b"(irq) : "memory");
+
+    return result == 0;
+}
+
+uint32_t u_alloc_dma(uint32_t pages, uint32_t *phys_out)
+{
+    uint32_t result;
+
+    __asm__ volatile ("int $0x80"
+                      : "=a"(result)
+                      : "a"(SYS_ALLOC_DMA), "b"(pages), "c"(phys_out)
+                      : "memory");
+
+    return result;
+}
+
+bool u_claim_irq(uint32_t irq)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_CLAIM_IRQ), "b"(irq) : "memory");
+
+    return result == 0;
+}
+
+uint32_t u_map_hw_buffer(void)
+{
+    uint32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_MAP_HW_BUFFER) : "memory");
+
+    return result;
+}
+
+bool u_klog_read(struct sys_klog *request)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_KLOG_READ), "b"(request) : "memory");
+
+    return result == 0;
+}
+
+bool u_trust_sender(uint32_t pid)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_TRUST_SENDER), "b"(pid) : "memory");
+
+    return result == 0;
 }
 
 int32_t u_send_bounded(uint32_t target_pid, const ipc_message_t *msg, uint32_t attempts)

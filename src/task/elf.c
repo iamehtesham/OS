@@ -6,7 +6,7 @@
 #include "mm/paging.h"
 #include "mm/pmm.h"
 #include "task/elf.h"
-#include "utils/stdio.h"
+#include "utils/klog.h"
 #include "utils/string.h"
 
 /* Loading an executable the kernel did not produce.
@@ -19,9 +19,12 @@
  * header claiming p_offset near 2^32 must fail a bounds test, not wrap past
  * it. */
 
+/* The most memory one PT_LOAD segment may occupy: 16 MiB. */
+#define ELF_MAX_SEGMENT_BYTES (16u << 20)
+
 static void reject(const char *reason)
 {
-    kprintf("elf: %s\n", reason);
+    klog("elf: %s\n", reason);
 }
 
 /* True when [offset, offset + length) lies wholly inside a file of `size`
@@ -112,6 +115,16 @@ static bool load_segment(uint32_t directory, const uint8_t *file, uint32_t size,
 
     if (!within_file(ph->p_offset, ph->p_filesz, size)) {
         reject("segment contents run past the end of the file");
+        return false;
+    }
+
+    /* A segment's memory size is what the loader ALLOCATES, and it comes from
+     * the file. The window check below would accept two gigabytes; a program
+     * asking for that would take every frame the kernel can reach before the
+     * failure that frees them again. Nothing here is within a thousandth of
+     * this, so the cap costs nothing legitimate. */
+    if (ph->p_memsz > ELF_MAX_SEGMENT_BYTES) {
+        reject("segment larger than any program this kernel will load");
         return false;
     }
 

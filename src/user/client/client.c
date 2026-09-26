@@ -225,5 +225,21 @@ void _start(void)
     *p = '\0';
     u_print(line);
 
+    /* And no hardware privilege: the two calls the keyboard driver lives on
+     * must both be refused to a process the kernel did not start as a driver.
+     * IOPL would hand this process every I/O port; the unmask would let it
+     * drive the interrupt controller for a line it does not serve. */
+    const bool iopl_raised = u_grant_io();
+    const bool unmasked    = u_unmask_irq(1u);
+
+    p = line;
+    p = u_append(p, U_LIMIT(line), "  [client] raise IOPL: ");
+    p = u_append(p, U_LIMIT(line), iopl_raised ? "ALLOWED (unexpected)" : "refused");
+    p = u_append(p, U_LIMIT(line), ", unmask IRQ1: ");
+    p = u_append(p, U_LIMIT(line), unmasked ? "ALLOWED (unexpected)" : "refused");
+    p = u_append(p, U_LIMIT(line), "\n");
+    *p = '\0';
+    u_print(line);
+
     park_forever();
 }
