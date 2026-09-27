@@ -3,6 +3,7 @@
 
 #include "cpu/isr.h"
 #include "drivers/pit.h"
+#include "ipc/ipc.h"
 #include "mm/pmm.h"
 #include "mm/shm.h"
 #include "task/scheduler.h"
@@ -103,6 +104,11 @@ static void scheduler_tick(struct registers *regs)
      * from the idle loop with interrupts on: two reapers, one of them
      * interruptible by the other, would race inside kfree. */
     const uint32_t reaped = task_reap_orphans();
+
+    /* Alarms, before schedule(): the switch inside may not return for a long
+     * time, and an alarm expiring on this tick should be pending before the
+     * next task is picked, so a task it wakes is eligible now. */
+    ipc_expire_alarms(pit_ticks());
 
     if (reaped > 0) {
         const uint32_t retired = shm_collect();

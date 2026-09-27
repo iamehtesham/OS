@@ -57,8 +57,8 @@ _Static_assert(__builtin_offsetof(arp_header_t, target_ip) == 24u, "target_ip mu
 #define ARP_REQUEST            1u
 #define ARP_REPLY              2u
 
-/* The addresses ARP answers for and asks about -- NET_LOCAL_IP, NET_GATEWAY_IP
- * and NET_IPV4 -- live in net/ipv4.h, with the IP layer they belong to. */
+/* The address ARP answers for and asks from is the one DHCP leased this
+ * machine (net/netcfg.h); until a lease is bound it answers nothing. */
 
 /* Looks at one received frame. If it is an ARP request for this machine's
  * address, builds and transmits the reply. Anything else is reported and
@@ -66,10 +66,11 @@ _Static_assert(__builtin_offsetof(arp_header_t, target_ip) == 24u, "target_ip mu
  * without the card's CRC. */
 void arp_receive(const uint8_t *frame, uint32_t frame_bytes);
 
-/* Broadcasts "who has `target_ip`?". Nothing here remembers the answer -- there
- * is no ARP cache. The IP layer above ARP only ever replies, and a reply goes
- * to the source MAC of the frame that asked, so nothing yet needs to look an
- * address up. This exists to prove the transmit path against a real stack. */
+/* Broadcasts "who has `target_ip`?", from the leased address. Called once, when
+ * a lease is bound, for the router the lease names -- never unbound, so it
+ * never asks from 0.0.0.0. Nothing here remembers the answer -- there is no ARP
+ * cache: the IP layer only replies to the MAC a request came from, and DHCP
+ * broadcasts, so nothing yet needs to look an address up. */
 bool arp_request(uint32_t target_ip);
 
 #endif /* NET_ARP_H */

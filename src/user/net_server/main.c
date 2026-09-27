@@ -23,6 +23,7 @@
 #include "arch/rtl8139.h"
 #include "ipc/ipc.h"
 #include "net/arp.h"
+#include "net/dhcp.h"
 #include "net/byteorder.h"
 #include "net/ethernet.h"
 #include "net/ipv4.h"
@@ -306,6 +307,14 @@ static bool drain_packets(void)
     uint32_t records = 0;
 
     while ((inb(io_base + RTL_CMD) & RTL_CMD_BUFE) == 0) {
+        /* Frames that keep coming keep the network server in this loop and
+         * out of recv, which is where the DHCP alarm is delivered -- a flood
+         * would hold off every retransmission and let a lease outlive its end,
+         * and with each frame logged a single batch can take seconds. So the
+         * client is asked, before each record, whether its alarm is due. What
+         * it may do then is transmit, which does not touch this ring. */
+        dhcp_poll();
+
         /* CAPR is already correct -- ring_advance moved it after the last
          * record -- so stopping here leaves nothing to repair. */
         if (++records > RTL_RX_BATCH_RECORDS) {
@@ -409,19 +418,29 @@ void _start(void)
 
     u_print("  [net] up: waiting for packets\n");
 
-    /* Say something. Until now this machine has only ever listened, and an ARP
-     * request is the smallest useful thing it can say: it is one frame, it needs
-     * no state, and any stack on the segment will answer it -- which makes it
-     * the shortest proof that the transmit path reaches a real peer rather than
-     * just filling a buffer. Under QEMU's user-mode network the gateway replies,
-     * and that reply arrives back through the receive ring. */
-    arp_request(NET_GATEWAY_IP);
+    /* Ask for an address. The machine has none -- 0.0.0.0 -- and answers
+     * nothing until a DHCP server leases it one, so the first thing it ever
+     * says is a DISCOVER broadcast. When the lease is granted, dhcp.c ARPs the
+     * router it names, which under QEMU's user-mode network is the gateway,
+     * and that reply is the proof the new address works. */
+    dhcp_start();
     recover_if_wedged();
 
     ipc_message_t msg;
 
     for (;;) {
         if (u_recv(&msg) != IPC_OK) {
+            continue;
+        }
+
+        /* The DHCP client's alarm: retransmit, start again, or end a lease.
+         * Before the interrupt filter below, and without its unmask -- no
+         * interrupt was taken. A send from here may be the one that wedges the
+         * transmitter, and before a lease a quiet segment raises no interrupt
+         * that would run the recovery, so it runs here too. */
+        if (msg.type == MSG_TIMER && msg.sender_pid == IPC_KERNEL_PID) {
+            dhcp_timer();
+            recover_if_wedged();
             continue;
         }
 
@@ -453,7 +472,8 @@ void _start(void)
          * batch is reset -- between batches, never inside one, because a reset
          * clears the ring the drain is reading. Stopping after a batch and
          * waiting for the next interrupt instead would strand whatever the card
-         * wrote before the ack, until some later frame happened to arrive. */
+         * wrote before the ack, until some later frame happened to arrive.
+         * (While this loop runs, drain_packets keeps the DHCP alarm served.) */
         if (isr & RTL_INT_ROK) {
             while (!drain_packets()) {
                 recover_if_wedged();

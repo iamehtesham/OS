@@ -52,14 +52,14 @@ USER_LINKER   := user.ld
 # because everything in a directory is linked into one binary, and two _starts
 # in one link is an error, so two applications are two directories.
 USER_PROGRAMS := vfs_server kbd_server input_server vga_server net_server apps/shell apps/calc \
-                 apps/app_a apps/app_b client shm_reader shm_writer mutex_b mutex_a
+                 apps/app_a apps/app_b apps/alarmtest client shm_reader shm_writer mutex_b mutex_a
 
 # Programs packed INTO the filesystem image, for the shell to spawn. The rest
 # of USER_PROGRAMS are the boot modules (the servers and the shell) and the
 # retired boot-time demos, which still build but are neither loaded at boot
 # nor shipped: they address each other by pids that only creation order at
 # boot ever made true.
-INITRD_PROGRAMS := apps/calc apps/app_a apps/app_b client
+INITRD_PROGRAMS := apps/calc apps/app_a apps/app_b apps/alarmtest client
 INITRD_STAGE    := $(BUILD_DIR)/initrd_root
 
 USER_LIB_SRCS := $(sort $(wildcard $(USER_LIB_DIR)/*.c)) $(sort $(wildcard $(USER_LIB_DIR)/*.S))
@@ -73,13 +73,20 @@ USER_OBJS     := $(USER_LIB_OBJS)
 # -fno-stack-protector: the default -fstack-protector-strong emits calls to
 #   __stack_chk_fail, which only libc provides.
 # -MMD -MP: emit .d files so edits to a header rebuild every source including it.
-CFLAGS := -m32 -std=gnu11 -O2 -Wall -Wextra \
+# -Wpedantic -Wvla -Wcast-align=strict: the warning gate, on every build. The
+#   last is what catches a wire field read through a uint32_t * at an arbitrary
+#   offset; `make warnings` runs the gate at every optimisation level.
+# OPT and EXTRA_CFLAGS exist to be overridden from the command line, as
+#   `make warnings` and the wrap kernel below do.
+OPT          := -O2
+EXTRA_CFLAGS :=
+CFLAGS := -m32 -std=gnu11 $(OPT) -Wall -Wextra -Wpedantic -Wvla -Wcast-align=strict \
           -ffreestanding \
           -fno-pie -fno-pic \
           -fno-stack-protector \
           -fno-asynchronous-unwind-tables \
           -MMD -MP \
-          -I$(INC_DIR)
+          -I$(INC_DIR) $(EXTRA_CFLAGS)
 
 ASFLAGS := -m32 -ffreestanding -MMD -MP -I$(INC_DIR)
 
@@ -106,7 +113,8 @@ OBJS   := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(S_SRCS)) \
           $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(C_SRCS))
 DEPS   := $(OBJS:.o=.d)
 
-.PHONY: all build qemu netdemo ping udp udp-host check screenshot clean force-initrd
+.PHONY: all build qemu netdemo ping udp udp-host dhcp wrap-kernel warnings check screenshot clean \
+        force-initrd
 
 # Without this make treats the ring-3 objects as intermediate files, deletes
 # them after linking, and then rebuilds them on every single invocation because
@@ -210,6 +218,9 @@ NET_DEVICE := -netdev user,id=net0 -device rtl8139,netdev=net0
 # QEMU hand every echo straight back to the guest, which echoes it again, until
 # QEMU exits. QEMU will not start if the port is taken:
 # make qemu UDP_ECHO_HOST_PORT=<other port>
+# The forward names 10.0.2.15, and the guest no longer has that address built
+# in: it leases one by DHCP. They match because QEMU's DHCP server leases
+# 10.0.2.15 to the first client it sees, and this machine is the only one.
 UDP_ECHO_HOST_PORT ?= 7007
 QEMU_NET_DEVICE := -netdev user,id=net0,hostfwd=udp:127.0.0.1:$(UDP_ECHO_HOST_PORT)-10.0.2.15:7 \
                    -device rtl8139,netdev=net0
@@ -218,23 +229,34 @@ qemu: build
 	$(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(QEMU_NET_DEVICE)
 
 # The same machine with a peer that talks back. `make qemu` exercises the
-# transmit path on its own -- the driver ARPs the gateway at startup and QEMU's
-# user-mode network answers -- and its port forward carries UDP to the echo
-# service, but a gateway that only answers never sends an ARP request or a ping,
-# so it cannot exercise those reply paths. Here the card is on a socket netdev:
-# real ARP, an ICMP echo request, a UDP echo, IPv4, IPv6 and unrecognised frames
-# are written into it, and the frames the guest transmits are read back and
-# decoded, so the ARP, ping and UDP echo replies are checked as bytes on the
+# transmit path on its own -- the driver leases an address from QEMU's DHCP
+# server, then ARPs the router it was given, and QEMU's user-mode network
+# answers -- and its port forward carries UDP to the echo service, but a
+# gateway that only answers never sends an ARP request or a ping, so it cannot
+# exercise those reply paths. Here the card is on a socket netdev: the tool
+# first plays the DHCP server, so the guest has an address to answer at, then
+# writes real ARP, an ICMP echo request, a UDP echo, IPv4, IPv6 and
+# unrecognised frames into it, and the frames the guest transmits are read back
+# and decoded, so the ARP, ping and UDP echo replies are checked as bytes on the
 # wire rather than as lines on the guest's console.
+#
+# Every socket-netdev target starts QEMU paused (-S) with a monitor socket: its
+# listening socket throws away whatever the guest sends before a peer has
+# connected, and the guest's first word is now a DHCP DISCOVER. The tool
+# connects, confirms through the monitor that QEMU has accepted it, and only
+# then resumes the guest.
 # Overridable, because a second copy of this on the same machine would collide:
 # make netdemo NET_DEMO_PORT=52140
 NET_DEMO_PORT   ?= 52139
-NET_DEMO_DEVICE := -netdev socket,id=net0,listen=127.0.0.1:$(NET_DEMO_PORT) \
-                   -device rtl8139,netdev=net0
-NET_DEMO_TOOL   := tools/inject_frames.py
+NET_DEMO_DEVICE  := -netdev socket,id=net0,listen=127.0.0.1:$(NET_DEMO_PORT) \
+                    -device rtl8139,netdev=net0
+NET_DEMO_MONITOR := $(BUILD_DIR)/netdemo-monitor.sock
+NET_DEMO_TOOL    := tools/inject_frames.py
 
 netdemo: build
-	@$(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(NET_DEMO_DEVICE) & \
+	@rm -f $(NET_DEMO_MONITOR); \
+	 $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(NET_DEMO_DEVICE) -S \
+	   -monitor unix:$(NET_DEMO_MONITOR),server=on,wait=off & \
 	 qemu_pid=$$!; \
 	 trap 'kill $$qemu_pid 2>/dev/null' INT TERM; \
 	 sleep 1; \
@@ -243,7 +265,8 @@ netdemo: build
 	   echo "Retry with: make netdemo NET_DEMO_PORT=<other port>"; \
 	   exit 1; \
 	 fi; \
-	 python3 $(NET_DEMO_TOOL) --port $(NET_DEMO_PORT) --count 8 --listen 4 || true; \
+	 python3 $(NET_DEMO_TOOL) --port $(NET_DEMO_PORT) --monitor $(NET_DEMO_MONITOR) \
+	   --count 8 --listen 4 || true; \
 	 echo "Press Esc in the QEMU window to see the console, or close it to finish."; \
 	 wait $$qemu_pid
 
@@ -265,13 +288,15 @@ netdemo: build
 # and its exit status is the verdict.
 PING_PORT   ?= 52141
 PING_PCAP   := $(BUILD_DIR)/ping.pcap
-PING_DEVICE := -netdev socket,id=net0,listen=127.0.0.1:$(PING_PORT) \
-               -device rtl8139,netdev=net0 \
-               -object filter-dump,id=dump0,netdev=net0,queue=rx,file=$(PING_PCAP)
+PING_MONITOR := $(BUILD_DIR)/ping-monitor.sock
+PING_DEVICE  := -netdev socket,id=net0,listen=127.0.0.1:$(PING_PORT) \
+                -device rtl8139,netdev=net0 \
+                -object filter-dump,id=dump0,netdev=net0,queue=rx,file=$(PING_PCAP)
 
 ping: build
-	@rm -f $(PING_PCAP); \
-	 $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(PING_DEVICE) -display none -no-reboot & \
+	@rm -f $(PING_PCAP) $(PING_MONITOR); \
+	 $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(PING_DEVICE) -display none -no-reboot \
+	   -S -monitor unix:$(PING_MONITOR),server=on,wait=off & \
 	 qemu_pid=$$!; \
 	 trap 'kill $$qemu_pid 2>/dev/null' INT TERM; \
 	 sleep 1; \
@@ -280,10 +305,11 @@ ping: build
 	   echo "Retry with: make ping PING_PORT=<other port>"; \
 	   exit 1; \
 	 fi; \
-	 python3 tools/ping.py --port $(PING_PORT); status=$$?; \
+	 python3 tools/ping.py --port $(PING_PORT) --monitor $(PING_MONITOR); status=$$?; \
 	 kill $$qemu_pid 2>/dev/null; wait $$qemu_pid 2>/dev/null; \
 	 replies=$$(tcpdump -nn -vv -r $(PING_PCAP) icmp 2>/dev/null | grep -c "ICMP echo reply"); \
-	 complaints=$$(tcpdump -nn -vv -r $(PING_PCAP) 2>/dev/null | grep -cE "bad cksum|wrong icmp cksum"); \
+	 complaints=$$(tcpdump -nn -vv -r $(PING_PCAP) 2>/dev/null \
+	               | grep -cE "bad cksum|bad udp cksum|no cksum|wrong icmp cksum"); \
 	 echo; \
 	 echo "tcpdump, reading $(PING_PCAP): $$replies echo replies from the guest," \
 	      "$$complaints checksum complaints"; \
@@ -328,7 +354,7 @@ endef
 
 udp: build
 	@rm -f $(UDP_PCAP) $(UDP_COUNT) $(UDP_MONITOR); \
-	 $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(UDP_DEVICE) \
+	 $(QEMU) -kernel $(KERNEL) -initrd $(MODULE_LIST) $(UDP_DEVICE) -S \
 	   -monitor unix:$(UDP_MONITOR),server=on,wait=off -display none -no-reboot & \
 	 qemu_pid=$$!; \
 	 trap 'kill $$qemu_pid 2>/dev/null' INT TERM; \
@@ -377,6 +403,43 @@ udp-host: build
 	 kill $$qemu_pid 2>/dev/null; wait $$qemu_pid 2>/dev/null; \
 	 $(call UDP_TCPDUMP_GATE,$(UDP_HOST_PCAP),$(UDP_HOST_COUNT)); \
 	 exit $$status
+
+# The DHCP client, against a DHCP server that tries to break it. tools/dhcp_test.py
+# is the only server on the guest's segment (a socket netdev) and launches its
+# own boots: the first walks a lease's whole life -- the DISCOVER and its
+# backoff, offers and acknowledgements refused for exactly one fault each, a NAK
+# and the restart, a server that never answers, leases that end on time, even
+# under a flood, masks and routers that must be refused or ignored -- the second
+# leases 10.0.2.42/16 to prove the address is the one leased, and the third,
+# alongside them, boots the wrap kernel and times the DISCOVER backoff to its
+# 64-s cap across the tick counter's wrap. tcpdump then re-decodes every frame
+# each boot's guest sent. Headless; the exit status is the verdict.
+dhcp: build wrap-kernel
+	@python3 tools/dhcp_test.py --kernel $(KERNEL) --wrap-kernel $(WRAP_KERNEL) \
+		--initrd $(MODULE_LIST) --build $(BUILD_DIR)
+
+# A kernel whose tick counter starts 10 s short of 2^32, in a build directory of
+# its own; the servers and the image stay the ordinary build's. An alarm armed
+# in its first seconds has a deadline past the wrap, which is otherwise 497
+# days of uptime away.
+WRAP_DIR    := $(BUILD_DIR)/wrap
+WRAP_KERNEL := $(WRAP_DIR)/kernel.bin
+wrap-kernel:
+	@$(MAKE) --no-print-directory BUILD_DIR=$(WRAP_DIR) \
+		EXTRA_CFLAGS=-DPIT_FIRST_TICK=0xFFFFFC18u $(WRAP_KERNEL)
+
+# The warning gate at every optimisation level, each in a build directory of
+# its own, warnings as errors, linked. One level proves nothing about another:
+# diagnostics differ, and so do calls into libgcc -- at -O0 a 64-bit division
+# is a call to __udivdi3, which this freestanding link does not have, while at
+# -O2 a division by a constant becomes a multiplication and the call vanishes.
+WARNING_LEVELS := -O0 -O1 -O2 -O3 -Os
+warnings:
+	@for o in $(WARNING_LEVELS); do \
+		$(MAKE) --no-print-directory -s BUILD_DIR=$(BUILD_DIR)/warn$$o OPT=$$o \
+			EXTRA_CFLAGS=-Werror build > /dev/null || { echo "$$o: FAILED"; exit 1; }; \
+		echo "$$o: clean"; \
+	done
 
 # Confirms the Multiboot 1 header is present, aligned and correctly checksummed.
 check: $(KERNEL)

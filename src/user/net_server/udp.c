@@ -19,6 +19,7 @@
 
 #include "net/byteorder.h"
 #include "net/checksum.h"
+#include "net/dhcp.h"
 #include "net/ethernet.h"
 #include "net/ipv4.h"
 #include "net/rtl8139.h"
@@ -45,6 +46,11 @@ _Static_assert(sizeof(checksum_scratch) == 1492u,
 /* The echo reply, built fresh, never edited in place in the receive ring. The
  * longest segment makes a reply of exactly one full frame. */
 static uint8_t reply[ETH_MAX_FRAME];
+
+/* Datagrams this machine originates (udp_send). Separate from `reply`, though
+ * nothing here runs two at once: the server handles one frame, or one timer,
+ * to completion before the next. */
+static uint8_t outgoing[ETH_MAX_FRAME];
 
 /* The most of a datagram's data the log shows, so that a line stays inside the
  * console's 80 columns. */
@@ -96,6 +102,31 @@ static bool udp_checksum(uint32_t src_ip, uint32_t dest_ip, const uint8_t *segme
      * and an odd final byte is padded on the right by net_checksum, as RFC 768
      * asks -- no special case here. */
     *sum = net_checksum(checksum_scratch, UDP_PSEUDO_HEADER_SIZE + length);
+    return true;
+}
+
+/* Finishes a segment built at `udp` behind the IPv4 header `ip`: computes the
+ * checksum over the pseudo-header, the header and the data, and stores it. The
+ * caller has zeroed the checksum field -- the checksum is defined over the
+ * segment with that field zero -- and the length field is final. One place for
+ * the rule every sender must follow: a transmitted 0 means "no checksum" (RFC
+ * 768), so a checksum that comes out as 0 is sent as 0xFFFF instead. In one's
+ * complement both are zero -- +0 and -0 -- so the receiver's sum still
+ * verifies. The reverse cannot arise: net_checksum returns 0xFFFF only for
+ * all-zero input, and the pseudo-header always carries protocol 17. */
+static bool udp_seal(const ipv4_header_t *ip, udp_header_t *udp)
+{
+    uint16_t sum;
+
+    if (!udp_checksum(ip->src_ip, ip->dest_ip, (const uint8_t *)udp, &sum)) {
+        return false;
+    }
+
+    if (sum == 0u) {
+        sum = 0xFFFFu;
+    }
+
+    udp->checksum = htons(sum);
     return true;
 }
 
@@ -198,8 +229,8 @@ static void echo_reply(const ethernet_header_t *eth, const ipv4_header_t *ip,
      * goes: every echo still leaves FROM port 7, so a service on some other
      * unprivileged port that trusts a privileged source port can still be sent
      * chosen bytes. Nor can it stop a loop with a reflector on an ordinary
-     * high port -- nothing that looks only at port numbers can -- and there is
-     * no clock here to rate-limit with. */
+     * high port -- nothing that looks only at port numbers can -- and no rate
+     * limit stands behind it (the kernel alarm could pace one; none is built). */
     if (src_port < UDP_FIRST_UNPRIVILEGED_PORT || src_port == UDP_PORT_NFS) {
         log_peer("UDP echo refused: ", source, src_port, " is a service port");
         return;
@@ -218,11 +249,11 @@ static void echo_reply(const ethernet_header_t *eth, const ipv4_header_t *ip,
     }
 
     /* Ethernet: back to the MAC the request came from, from this card's own.
-     * IPv4: a fresh header from this machine's address to the request's
-     * source. For a request unicast to 10.0.2.15 -- the only kind ipv4_receive
-     * passes up -- that is the same as swapping the request's addresses, but
-     * it never copies the request's destination, which for a broadcast would
-     * forge a reply "from" the broadcast address. */
+     * IPv4: a fresh header from this machine's leased address to the
+     * request's source. For a request unicast to that address -- the only kind
+     * that reaches echo -- that is the same as swapping the request's
+     * addresses, but it never copies the request's destination, which for a
+     * broadcast would forge a reply "from" the broadcast address. */
     uint8_t *const ip_start =
         net_write_ethernet_header(reply, eth->src_mac, rtl8139_mac(), ETHERTYPE_IPV4);
     uint8_t *const udp_start =
@@ -246,24 +277,10 @@ static void echo_reply(const ethernet_header_t *eth, const ipv4_header_t *ip,
 
     /* Over the reply's own addresses, which the pseudo-header must match: the
      * ones the receiver will see in the IPv4 header in front of this. */
-    const ipv4_header_t *const out_ip = (const ipv4_header_t *)ip_start;
-    uint16_t                   sum;
-
-    if (!udp_checksum(out_ip->src_ip, out_ip->dest_ip, udp_start, &sum)) {
+    if (!udp_seal((const ipv4_header_t *)ip_start, out)) {
         u_print("  [net] a UDP echo whose checksum could not be computed; dropped\n");
         return;
     }
-
-    /* A transmitted 0 means "no checksum" (RFC 768), so a checksum that comes
-     * out as 0 is sent as 0xFFFF instead. In one's complement both are zero --
-     * +0 and -0 -- so the receiver's sum still verifies. The reverse cannot
-     * arise: net_checksum returns 0xFFFF only for all-zero input, and the
-     * pseudo-header always carries protocol 17. */
-    if (sum == 0u) {
-        sum = 0xFFFFu;
-    }
-
-    out->checksum = htons(sum);
 
     /* Send first, log after: the log line is an IPC round trip to the console,
      * and the sender is timing the reply. */
@@ -274,7 +291,7 @@ static void echo_reply(const ethernet_header_t *eth, const ipv4_header_t *ip,
 }
 
 void udp_receive(const ethernet_header_t *eth, const ipv4_header_t *ip, const uint8_t *segment,
-                 uint32_t length)
+                 uint32_t length, bool broadcast)
 {
     /* 1. Room for a UDP header. Until this passes, not one byte of it may be
      *    read. On the wire nothing depends on it -- checks 3 and 4 together
@@ -329,10 +346,26 @@ void udp_receive(const ethernet_header_t *eth, const ipv4_header_t *ip, const ui
         }
     }
 
-    /* 6. What it says, now that it is known to be what was sent. */
+    /* 6. The DHCP client's port. Its messages are binary and the client logs
+     *    what they mean, so no text preview; and this is the one port a
+     *    broadcast may reach -- a server has no address to send an OFFER to
+     *    until the OFFER has been accepted. */
+    if (dest_port == DHCP_CLIENT_PORT) {
+        dhcp_receive(src_port, segment + UDP_HEADER_SIZE, udp_length - UDP_HEADER_SIZE);
+        return;
+    }
+
+    /* Nothing else answers a broadcast. Echo in particular: an echo server
+     * that answered one would be the reflector half of a "fraggle" flood. */
+    if (broadcast) {
+        drop("a broadcast, and only DHCP listens for those");
+        return;
+    }
+
+    /* 7. What it says, now that it is known to be what was sent. */
     log_data(segment + UDP_HEADER_SIZE, udp_length - UDP_HEADER_SIZE, checksummed);
 
-    /* 7. Whoever is listening on the destination port. Only echo is. Nothing
+    /* 8. Whoever is listening on the destination port. Only echo is. Nothing
      *    is sent back for the rest: RFC 1122 says a host SHOULD answer with an
      *    ICMP port-unreachable, and there is no ICMP error generation here. */
     if (dest_port != UDP_PORT_ECHO) {
@@ -351,4 +384,36 @@ void udp_receive(const ethernet_header_t *eth, const ipv4_header_t *ip, const ui
     }
 
     echo_reply(eth, ip, segment, udp_length, src_port);
+}
+
+bool udp_send(const uint8_t *dst_mac, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
+              uint16_t dst_port, const uint8_t *data, uint32_t length)
+{
+    /* The longest datagram this machine accepts is the longest it sends. */
+    if (length > UDP_MAX_LENGTH - UDP_HEADER_SIZE) {
+        return false;
+    }
+
+    const uint32_t udp_length   = UDP_HEADER_SIZE + length;
+    const uint32_t frame_length = ETH_HEADER_SIZE + IPV4_HEADER_SIZE + udp_length;
+
+    uint8_t *const ip_start =
+        net_write_ethernet_header(outgoing, dst_mac, rtl8139_mac(), ETHERTYPE_IPV4);
+    uint8_t *const udp_start =
+        ipv4_write_header(ip_start, src_ip, dst_ip, IPV4_PROTOCOL_UDP, 0, udp_length);
+
+    udp_header_t *const udp = (udp_header_t *)udp_start;
+
+    udp->src_port  = htons(src_port);
+    udp->dest_port = htons(dst_port);
+    udp->length    = htons((uint16_t)udp_length);
+    udp->checksum  = 0;
+
+    u_memcpy(udp_start + UDP_HEADER_SIZE, data, length);
+
+    if (!udp_seal((const ipv4_header_t *)ip_start, udp)) {
+        return false;
+    }
+
+    return rtl8139_send_packet(outgoing, frame_length);
 }

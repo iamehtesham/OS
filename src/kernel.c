@@ -17,6 +17,7 @@
 #include "mm/paging.h"
 #include "mm/pmm.h"
 #include "mm/shm.h"
+#include "sys/syscall_abi.h"
 #include "task/scheduler.h"
 #include "task/task.h"
 #include "multiboot.h"
@@ -384,7 +385,7 @@ static void userland_start(const struct multiboot_info *mbi)
 
     /* Order matters: the chip and the hook must both be live before the first
      * tick can arrive, and no tick can arrive until sti in kernel_main. */
-    pit_init(100);
+    pit_init(SYS_ALARM_HZ);
     scheduler_init();
 
     /* The server is created first so it takes the pid its clients are compiled

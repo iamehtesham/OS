@@ -1,6 +1,7 @@
 #ifndef NET_UDP_H
 #define NET_UDP_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "net/ethernet.h"
@@ -89,13 +90,25 @@ _Static_assert(ETH_HEADER_SIZE + IPV4_HEADER_SIZE + UDP_MAX_LENGTH == ETH_MAX_FR
 #define UDP_PORT_NFS                2049u
 
 /* Handles one UDP segment that ipv4_receive has already validated as far as
- * IPv4 goes: addressed to this machine at both layers, from a sane unicast
- * source, not a fragment, and `length` bytes long by the IPv4 header's account
- * -- which is at most UDP_MAX_LENGTH. Validates the UDP header and checksum,
- * echoes a datagram sent to port 7, and reports anything else. The Ethernet and
- * IPv4 headers are passed because the reply is addressed from them and the
- * checksum covers the IP addresses. In src/user/net_server/udp.c. */
+ * IPv4 goes: from a sane unicast source, not a fragment, `length` bytes long by
+ * the IPv4 header's account -- at most UDP_MAX_LENGTH -- and either addressed
+ * to this machine's leased address at its MAC, or, with `broadcast` true, sent
+ * to the limited broadcast. Validates the UDP header and checksum, gives a
+ * datagram for port 68 to the DHCP client, echoes one sent to port 7, and
+ * reports anything else. A broadcast goes to DHCP or nowhere: nothing else here
+ * answers one. The Ethernet and IPv4 headers are passed because a reply is
+ * addressed from them and the checksum covers the IP addresses. In
+ * src/user/net_server/udp.c. */
 void udp_receive(const ethernet_header_t *eth, const ipv4_header_t *ip, const uint8_t *segment,
-                 uint32_t length);
+                 uint32_t length, bool broadcast);
+
+/* Sends `length` bytes of data as one UDP datagram from `src_port` to
+ * `dst_port` (host order), at `src_ip` to `dst_ip` (NETWORK order, as
+ * ipv4_write_header takes them), in an Ethernet frame to `dst_mac`. For
+ * datagrams this machine originates rather than answers -- DHCP's, sent from
+ * 0.0.0.0 before there is an address. Always checksummed. False if it could
+ * not be built or sent. */
+bool udp_send(const uint8_t *dst_mac, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
+              uint16_t dst_port, const uint8_t *data, uint32_t length);
 
 #endif /* NET_UDP_H */

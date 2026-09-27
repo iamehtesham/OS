@@ -29,7 +29,7 @@ other addresses, broadcast and multicast sources, fragments, malformed headers,
 oversized datagrams, non-echo ICMP -- and after each one proves the guest is
 still alive by pinging it properly.
 
-usage: tools/ping.py --port N [--host H] [--wait S]
+usage: tools/ping.py --port N --monitor PATH [--host H] [--wait S]
 Exit status 0 only if every case passes.
 """
 
@@ -72,10 +72,10 @@ class Wire:
 
     def note(self, frame):
         """Checks the IPv4 identification of every datagram the guest sends:
-        each must be the previous one plus one. Nothing the guest transmits is
-        IPv4 except replies, and every protocol's replies take their number
-        from one shared counter, so a gap or a repeat means a reply was built
-        some other way. Every frame read off the socket passes through here."""
+        each must be the previous one plus one. Every IPv4 datagram the guest
+        transmits -- its DHCP messages and every reply -- takes its number from
+        one shared counter, so a gap or a repeat means one was built some other
+        way. Every frame read off the socket passes through here."""
         if len(frame) >= 34 and frame[12:14] == b"\x08\x00":
             ident = struct.unpack(">H", frame[18:20])[0]
             if self.last_id is not None and ident != (self.last_id + 1) & 0xFFFF:
@@ -96,17 +96,27 @@ class Wire:
         for _ in self.frames(seconds):
             pass
 
-    def await_guest(self, seconds):
-        """Asks "who has 10.0.2.15?" until the guest answers, and learns its MAC
+    def lease(self, address=GUEST_IP, **terms):
+        """Plays the DHCP server: answers the guest's DISCOVER and REQUEST so it
+        leases `address` (10.0.2.15 unless told otherwise), with an infinite
+        lease, so nothing prompts it to speak again unasked. The guest answers
+        nothing at all until this is done. Returns the guest's DISCOVER and
+        REQUEST as inject_frames.dhcp_parse decodes them. See take_lease for
+        what a test suite does with a guest that refuses it."""
+        return wire.serve_lease(self.frames, self.send, address=address, **terms)
+
+    def await_guest(self, seconds, address=GUEST_IP):
+        """Asks "who has <address>?" until the guest answers, and learns its MAC
         from the answer. Replaces a fixed sleep: the guest is ready exactly when
-        it can reply, not after some guessed number of seconds."""
-        ask = wire.ethernet_frame("arp")
+        it can reply, not after some guessed number of seconds -- and the answer
+        is also the proof that the lease was taken."""
+        ask = wire.BROADCAST + wire.GATEWAY_MAC + b"\x08\x06" + wire.arp_request(address)
         deadline = time.time() + seconds
         while time.time() < deadline:
             self.send(ask)
             for f in self.frames(0.5):
                 if (len(f) >= 42 and f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x02"
-                        and f[28:32] == GUEST_IP):
+                        and f[28:32] == address):
                     self.guest_mac = f[22:28]
                     return True
         return False
@@ -216,7 +226,7 @@ def zero_checksum_data(ident, seq, length):
 # ---- checking a reply -------------------------------------------------------
 
 def problems(reply, guest_mac, message, request_src_ip=GW_IP, request_src_mac=GW_MAC,
-             request_tos=0):
+             request_tos=0, guest_ip=GUEST_IP):
     """Everything wrong with `reply` as the answer to `message`. Empty if none."""
     bad = []
     ip_len = 20 + len(message)
@@ -245,8 +255,8 @@ def problems(reply, guest_mac, message, request_src_ip=GW_IP, request_src_mac=GW
         bad.append(f"TTL {ttl}, want 64")
     if proto != 1:
         bad.append(f"protocol {proto}, want 1")
-    if ip[12:16] != GUEST_IP:
-        bad.append(f"IPv4 source {ip_text(ip[12:16])}, want 10.0.2.15")
+    if ip[12:16] != guest_ip:
+        bad.append(f"IPv4 source {ip_text(ip[12:16])}, want {ip_text(guest_ip)}")
     if ip[16:20] != request_src_ip:
         bad.append(f"IPv4 destination {ip_text(ip[16:20])}, want {ip_text(request_src_ip)}")
     if wire.internet_checksum(ip) != 0:
@@ -271,6 +281,33 @@ def problems(reply, guest_mac, message, request_src_ip=GW_IP, request_src_mac=GW
 
 
 # ---- the cases --------------------------------------------------------------
+
+LEASE_CASE = "a checksummed OFFER and ACK from 10.0.2.2:67 lease the guest 10.0.2.15"
+
+
+def take_lease(w, run):
+    """Leases the guest 10.0.2.15, as the first case of the run.
+
+    The OFFER and ACK carry UDP checksums, as QEMU's do, and taking them needs
+    everything on the way to the DHCP client to work: the IPv4 checks, UDP's
+    length and checksum verification, the ports read in the right byte order.
+    A guest broken in any of those ways refuses the lease -- and a suite that
+    stopped there would never reach the cases written for the broken thing. So
+    a refused OFFER or ACK fails this case and is sent again with no checksum
+    (UDP's 0), and the run goes on. False only if even that is refused."""
+    refusals = []
+    try:
+        w.lease(refused=refusals.append)
+    except RuntimeError as e:
+        run.fail(LEASE_CASE, str(e))
+        return False
+    if refusals:
+        run.fail(LEASE_CASE, f"the guest ignored the checksummed {' and '.join(refusals)}; "
+                             "it took them only with no checksum")
+    else:
+        print(f"  ok   {LEASE_CASE}")
+    return True
+
 
 class Run:
     def __init__(self, w):
@@ -337,16 +374,22 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--wait", type=float, default=20.0, help="seconds to wait for the guest")
+    ap.add_argument("--monitor", required=True,
+                    help="QEMU monitor socket: QEMU starts paused and is resumed from here")
     args = ap.parse_args()
 
     w = Wire(args.host, args.port, args.wait)
+    run = Run(w)
+    wire.Monitor(args.monitor, args.wait).start_guest()
+    if not take_lease(w, run):
+        print(f"{len(run.failures)} case(s) FAILED: {', '.join(run.failures)}")
+        return 1
     if not w.await_guest(args.wait):
         print("the guest never answered ARP for 10.0.2.15")
         return 1
     print(f"PING 10.0.2.15 over QEMU's socket netdev; guest is at {w.guest_mac.hex(':')}\n")
     w.drain(0.5)
 
-    run = Run(w)
     mac = w.guest_mac
 
     print("replies that must come back, correct:")

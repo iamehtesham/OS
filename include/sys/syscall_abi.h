@@ -116,6 +116,30 @@
  * non-driver caller. */
 #define SYS_CLAIM_IRQ 19u
 
+/* ebx = ticks from now -> 0, or -1. Arms this task's one alarm: when that many
+ * timer ticks have passed, the task's next recv returns a MSG_TIMER from the
+ * kernel (IPC_KERNEL_PID), ahead of any interrupt or message. 0 cancels. Arming
+ * or cancelling also discards an expiry that fired but was never collected, so
+ * a cancelled alarm can never arrive late. Refused, changing nothing, for 2^31
+ * ticks or more -- the deadline is compared by signed difference, and a longer
+ * one would look already past. One alarm per task; arming replaces it. */
+#define SYS_ALARM 20u
+
+/* -> the number of timer ticks since boot (SYS_ALARM_HZ a second), wrapping at
+ * 2^32 -- compare two readings by their signed difference. The clock alarms
+ * count in: a program can ask whether an alarm it armed is due without waiting
+ * in recv for it, and measure how long something took. */
+#define SYS_TICKS 21u
+
+/* The tick rate an alarm counts in. The kernel programs the timer from this
+ * constant, so the number ring 3 uses to turn seconds into ticks and the rate
+ * the hardware runs at cannot drift apart -- to within the PIT's whole-number
+ * divisor: 1193182 / 11931 is 100.007 Hz, so a tick is 69 parts per million
+ * short of 10 ms, and an alarm ends that much early (a day's lease, six seconds
+ * early -- the safe side of a lease). */
+#define SYS_ALARM_HZ 100u
+#define SYS_ALARM_MAX_TICKS 0x7FFFFFFFu
+
 /* Largest DMA buffer, in pages. An RTL8139 RX ring is 8 KiB plus slack; three
  * pages covers it, and this leaves generous room above that. */
 #define DMA_MAX_PAGES 16u

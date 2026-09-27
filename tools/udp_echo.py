@@ -35,18 +35,18 @@ one thing wrong with it, or checksum 0 where the check under test comes before
 the checksum -- and after each one proves the guest is still alive, alternately
 with a UDP echo and an ICMP ping.
 
-With --monitor it also reads the guest's console out of VGA memory through the
-QEMU monitor, and checks that the brief's log line appears and that a datagram
-full of control characters is shown as dots on a line of its own.
+Through the QEMU monitor it starts the paused guest, leases it 10.0.2.15 by
+DHCP, and reads the guest's console out of VGA memory, to check that the
+brief's log line appears and that a datagram full of control characters is
+shown as dots on a line of its own.
 
-usage: tools/udp_echo.py --port N [--host H] [--wait S] [--monitor PATH]
+usage: tools/udp_echo.py --port N --monitor PATH [--host H] [--wait S]
                          [--count-file PATH]
 Exit status 0 only if every case passes.
 """
 
 import argparse
 import os
-import re
 import socket
 import struct
 import sys
@@ -121,7 +121,7 @@ def two_fold_data(sport, n=1472):
 # ---- checking a reply -------------------------------------------------------
 
 def problems(reply, guest_mac, sport, dport, data, request_src_ip=GW_IP, request_src_mac=GW_MAC,
-             request_tos=0):
+             request_tos=0, guest_ip=GUEST_IP):
     """Everything wrong with `reply` as the echo of `data` sent from sport to
     dport. Empty if none."""
     bad = []
@@ -151,8 +151,8 @@ def problems(reply, guest_mac, sport, dport, data, request_src_ip=GW_IP, request
         bad.append(f"TTL {ttl}, want 64")
     if proto != 17:
         bad.append(f"protocol {proto}, want 17")
-    if ip[12:16] != GUEST_IP:
-        bad.append(f"IPv4 source {ip_text(ip[12:16])}, want 10.0.2.15")
+    if ip[12:16] != guest_ip:
+        bad.append(f"IPv4 source {ip_text(ip[12:16])}, want {ip_text(guest_ip)}")
     if ip[16:20] != request_src_ip:
         bad.append(f"IPv4 destination {ip_text(ip[16:20])}, want {ip_text(request_src_ip)}")
     if wire.internet_checksum(ip) != 0:
@@ -166,7 +166,7 @@ def problems(reply, guest_mac, sport, dport, data, request_src_ip=GW_IP, request
         bad.append(f"UDP length {r_len}, want {length}")
     if seg[8:] != data:
         bad.append("data changed")
-    want_ck = wire.udp_checksum(GUEST_IP, request_src_ip, seg[:6] + b"\x00\x00" + seg[8:])
+    want_ck = wire.udp_checksum(guest_ip, request_src_ip, seg[:6] + b"\x00\x00" + seg[8:])
     if r_ck == 0:
         bad.append("the reply carries no checksum (0)")
     elif r_ck != want_ck:
@@ -182,61 +182,7 @@ def problems(reply, guest_mac, sport, dport, data, request_src_ip=GW_IP, request
 
 # ---- the guest's console, through the QEMU monitor --------------------------
 
-class Monitor:
-    """QEMU's human monitor on a Unix socket: send a command, read until the
-    next prompt. Used to press Esc (show the system console) and to read the
-    80x25 text screen straight out of VGA memory at 0xB8000 -- what is on the
-    screen, not what the guest believes it printed."""
-
-    ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
-
-    def __init__(self, path, wait):
-        deadline = time.time() + wait
-        while True:
-            try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(path)
-                break
-            except OSError:
-                self.sock.close()
-                if time.time() > deadline:
-                    raise
-                time.sleep(0.2)
-        self.read_prompt()
-
-    def read_prompt(self, seconds=10.0):
-        buffered = b""
-        deadline = time.time() + seconds
-        while not self.ANSI.sub(b"", buffered).rstrip().endswith(b"(qemu)"):
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError("the QEMU monitor stopped answering")
-            self.sock.settimeout(remaining)
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("the QEMU monitor closed")
-            buffered += chunk
-        return self.ANSI.sub(b"", buffered).decode(errors="replace")
-
-    def command(self, text):
-        self.sock.sendall(text.encode() + b"\n")
-        return self.read_prompt()
-
-    def screen(self):
-        """The 25 rows of text on the screen, trailing spaces removed. The
-        guest is paused while it is read, so no row changes half-way."""
-        self.command("stop")
-        try:
-            dump = self.command("xp /2000hx 0xb8000")
-        finally:
-            self.command("cont")
-        cells = []
-        for line in dump.splitlines():
-            m = re.match(r"^\s*0*b[89a-f][0-9a-f]{3}:\s+(.*)$", line.strip(), re.I)
-            if m:
-                cells += [int(w, 16) & 0xFF for w in m.group(1).split() if w.startswith("0x")]
-        return ["".join(chr(c) if 32 <= c < 127 else " " for c in cells[r * 80:(r + 1) * 80]).rstrip()
-                for r in range(25)]
+Monitor = wire.Monitor  # moved to inject_frames.py, the one home of test plumbing
 
 
 def sanitised(data):
@@ -368,24 +314,28 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--wait", type=float, default=20.0, help="seconds to wait for the guest")
-    ap.add_argument("--monitor", help="QEMU monitor socket, to read the guest's console")
+    ap.add_argument("--monitor", required=True,
+                    help="QEMU monitor socket: QEMU starts paused and is resumed from here, "
+                         "and the guest's console is read through it")
     ap.add_argument("--count-file", help="write the number of UDP replies accepted here")
     args = ap.parse_args()
 
     w = ping.Wire(args.host, args.port, args.wait)
+    run = Run(w)
+    monitor = Monitor(args.monitor, args.wait)
+    monitor.start_guest()
+    if not ping.take_lease(w, run):
+        print(f"{len(run.failures)} case(s) FAILED: {', '.join(run.failures)}")
+        return 1
     if not w.await_guest(args.wait):
         print("the guest never answered ARP for 10.0.2.15")
         return 1
     print(f"UDP to 10.0.2.15:7 over QEMU's socket netdev; guest is at {w.guest_mac.hex(':')}\n")
     w.drain(0.5)
 
-    monitor = None
-    if args.monitor:
-        monitor = Monitor(args.monitor, args.wait)
-        monitor.command("sendkey esc")        # show the system console, where [net] logs
-        time.sleep(0.5)
+    monitor.command("sendkey esc")        # show the system console, where [net] logs
+    time.sleep(0.5)
 
-    run = Run(w)
     mac = w.guest_mac
 
     print("datagrams that must come back, correct:")

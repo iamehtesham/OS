@@ -21,11 +21,12 @@ tools/udp_echo.py and the review harnesses import its builders and its reader
 instead of keeping copies, because two copies of a frame builder drifted apart
 once already.
 
-usage: inject_frames.py [--port N] [--count K] [--delay S] [--gap S]
+usage: inject_frames.py --monitor PATH [--port N] [--count K] [--gap S]
                         [--kinds arp,ping,udp_echo,ipv4,ipv6,unknown,runt] [--listen S]
 """
 
 import argparse
+import re
 import socket
 import struct
 import sys
@@ -162,26 +163,299 @@ class FrameReader:
             self.buffered += chunk
 
 
-def arp_request():
-    """who-has 10.0.2.15, tell 10.0.2.2 -- the gateway asking for THIS machine.
+# ---- the QEMU monitor ---------------------------------------------------------
+
+class Monitor:
+    """QEMU's human monitor on a Unix socket: send a command, read until the
+    next prompt. Every harness starts QEMU paused (-S), connects to the network
+    card's socket, waits here until QEMU has accepted that connection, and only
+    then lets the guest run -- QEMU's listening socket netdev throws away
+    whatever the guest sends before it has a peer, and the guest's first word
+    is now a DHCP DISCOVER that must not be lost. Also used to press Esc (show
+    the system console) and to read the 80x25 screen out of VGA memory at
+    0xB8000 -- what is on the screen, not what the guest believes it printed."""
+
+    ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+
+    def __init__(self, path, wait):
+        deadline = time.time() + wait
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(path)
+                break
+            except OSError:
+                self.sock.close()
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.2)
+        self.read_prompt()
+
+    def read_prompt(self, seconds=10.0):
+        buffered = b""
+        deadline = time.time() + seconds
+        while not self.ANSI.sub(b"", buffered).rstrip().endswith(b"(qemu)"):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError("the QEMU monitor stopped answering")
+            self.sock.settimeout(remaining)
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("the QEMU monitor closed")
+            buffered += chunk
+        return self.ANSI.sub(b"", buffered).decode(errors="replace")
+
+    def command(self, text):
+        self.sock.sendall(text.encode() + b"\n")
+        return self.read_prompt()
+
+    def start_guest(self, seconds=10.0):
+        """Resumes a guest started with -S, once the card's socket netdev
+        reports a peer. A client's connect() returns as soon as the host kernel
+        has queued it, before QEMU's accept() has run, so the connection is
+        confirmed from QEMU's side first."""
+        deadline = time.time() + seconds
+        while "connection from" not in self.command("info network"):
+            if time.time() > deadline:
+                raise TimeoutError("QEMU never accepted the netdev connection")
+            time.sleep(0.05)
+        self.command("cont")
+
+    def screen(self):
+        """The 25 rows of text on the screen, trailing spaces removed. The
+        guest is paused while it is read, so no row changes half-way -- which
+        also stops the guest's clock, so never read the screen inside an
+        interval being timed."""
+        self.command("stop")
+        try:
+            dump = self.command("xp /2000hx 0xb8000")
+        finally:
+            self.command("cont")
+        cells = []
+        for line in dump.splitlines():
+            m = re.match(r"^\s*0*b[89a-f][0-9a-f]{3}:\s+(.*)$", line.strip(), re.I)
+            if m:
+                cells += [int(w, 16) & 0xFF for w in m.group(1).split() if w.startswith("0x")]
+        return ["".join(chr(c) if 32 <= c < 127 else " " for c in cells[r * 80:(r + 1) * 80]).rstrip()
+                for r in range(25)]
+
+
+# ---- DHCP (RFC 2131), the server's side ------------------------------------------
+
+DHCP_COOKIE = bytes([0x63, 0x82, 0x53, 0x63])
+DHCP_TYPES = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE", 5: "ACK", 6: "NAK",
+              7: "RELEASE", 8: "INFORM"}
+BROADCAST_IP = bytes([255, 255, 255, 255])
+MASK_24 = bytes([255, 255, 255, 0])
+LEASE_INFINITE = 0xFFFFFFFF
+
+
+def dhcp_parse(frame):
+    """Decodes a DHCP message the guest sent, from the Ethernet header up --
+    written from RFC 2131, not from dhcp.c. Returns a dict of every field; the
+    options as an ordered list of (code, bytes) and as a dict of the first of
+    each; what follows End. Raises ValueError for anything that is not a
+    well-formed DHCP message at the framing level (wrong EtherType or protocol,
+    lengths that do not fit, no cookie, an option running past the end, no
+    End). Judging whether the fields are RIGHT is the caller's business."""
+    if len(frame) < 14 + 20 + 8 or frame[12:14] != b"\x08\x00":
+        raise ValueError("not an IPv4 frame")
+    ihl = (frame[14] & 0x0F) * 4
+    ip = frame[14:14 + ihl]
+    total = struct.unpack(">H", ip[2:4])[0]
+    if ip[9] != 17 or len(frame) < 14 + total:
+        raise ValueError("not a whole UDP datagram")
+    seg = frame[14 + ihl:14 + total]
+    sport, dport, ulen, uck = struct.unpack(">HHHH", seg[:8])
+    if ulen > len(seg) or ulen < 8:
+        raise ValueError("the UDP length does not fit")
+    bootp = seg[8:ulen]
+    if len(bootp) < 240:
+        raise ValueError(f"a {len(bootp)}-byte BOOTP message is shorter than 240")
+    (op, htype, hlen, hops, xid, secs, flags, ciaddr, yiaddr, siaddr,
+     giaddr) = struct.unpack(">BBBBIHH4s4s4s4s", bootp[:28])
+    options, first, i, end_at = [], {}, 240, None
+    while i < len(bootp):
+        code = bootp[i]
+        if code == 0:
+            i += 1
+            continue
+        if code == 255:
+            end_at = i
+            break
+        if i + 1 >= len(bootp):
+            raise ValueError("an option code with no length byte")
+        n = bootp[i + 1]
+        if i + 2 + n > len(bootp):
+            raise ValueError(f"option {code} runs past the message")
+        value = bootp[i + 2:i + 2 + n]
+        options.append((code, value))
+        first.setdefault(code, value)
+        i += 2 + n
+    if end_at is None:
+        raise ValueError("no End option")
+    zeroed = seg[:6] + b"\x00\x00" + seg[8:ulen]
+    return {
+        "eth_dst": frame[0:6], "eth_src": frame[6:12],
+        "ip_src": ip[12:16], "ip_dst": ip[16:20], "ip_id": struct.unpack(">H", ip[4:6])[0],
+        "ip_ttl": ip[8], "ip_flags": struct.unpack(">H", ip[6:8])[0], "ihl": ihl,
+        "ip_checksum_ok": internet_checksum(ip) == 0,
+        "sport": sport, "dport": dport, "udp_checksum": uck,
+        "udp_checksum_ok": uck != 0 and udp_checksum(ip[12:16], ip[16:20], zeroed) == uck,
+        "length": len(bootp), "op": op, "htype": htype, "hlen": hlen, "hops": hops,
+        "xid": xid, "secs": secs, "flags": flags, "ciaddr": ciaddr, "yiaddr": yiaddr,
+        "siaddr": siaddr, "giaddr": giaddr, "chaddr": bootp[28:44], "sname": bootp[44:108],
+        "file": bootp[108:236], "cookie": bootp[236:240], "options": options,
+        "option": first, "type": first.get(53, b"\x00")[0] if first.get(53) else None,
+        "after_end": bootp[end_at + 1:],
+    }
+
+
+def is_dhcp_from_guest(frame):
+    """A frame from the guest's DHCP client port -- cheap enough for a filter."""
+    return (len(frame) >= 42 and frame[12:14] == b"\x08\x00" and frame[23] == 17
+            and frame[14 + (frame[14] & 0x0F) * 4:][:4] == b"\x00\x44\x00\x43")
+
+
+def dhcp_options(message_type, *, server=GATEWAY_IP, mask=MASK_24, router=GATEWAY_IP,
+                 lease=LEASE_INFINITE, extra=b"", end=True):
+    """The options of a server reply, in QEMU's order: 53, 54, 1, 3, 51, End.
+    Any of server, mask, router and lease may be None to leave it out."""
+    out = bytes([53, 1, message_type])
+    if server is not None:
+        out += bytes([54, 4]) + server
+    if mask is not None:
+        out += bytes([1, 4]) + mask
+    if router is not None:
+        out += bytes([3, len(router)]) + router   # one address, or a list of them
+    if lease is not None:
+        out += bytes([51, 4]) + struct.pack(">I", lease)
+    return out + extra + (b"\xff" if end else b"")
+
+
+def dhcp_reply(xid, yiaddr, *, message_type=2, chaddr=GUEST_MAC, options=None, op=2, htype=1,
+               hlen=6, flags=0, siaddr=GATEWAY_IP, cookie=DHCP_COOKIE, pad_to=548, cut_to=None,
+               src_mac=GATEWAY_MAC, dst_mac=BROADCAST, src_ip=GATEWAY_IP, dst_ip=BROADCAST_IP,
+               sport=67, dport=68, checksum=None, beyond=b"", **option_fields):
+    """A server's reply as QEMU's user-mode network sends one: from
+    52:55:0a:00:02:02 / 10.0.2.2:67 to ff:ff:ff:ff:ff:ff / 255.255.255.255:68,
+    UDP checksummed, the BOOTP message zero-padded to 548 bytes. Every field can
+    be overridden, `options` replaces the option bytes whole (End included),
+    `cut_to` truncates the BOOTP message, and `beyond` puts bytes after the
+    datagram in the frame -- so a test can build a reply wrong in exactly one
+    way."""
+    if options is None:
+        options = dhcp_options(message_type, **option_fields)
+    head = struct.pack(">BBBBIHH4s4s4s4s", op, htype, hlen, 0, xid, 0, flags, bytes(4), yiaddr,
+                       siaddr, bytes(4))
+    message = (head + chaddr.ljust(16, b"\x00") + bytes(64) + bytes(128) + cookie + options)
+    if pad_to and len(message) < pad_to:
+        message += bytes(pad_to - len(message))
+    if cut_to is not None:
+        message = message[:cut_to]
+    segment = udp_segment(src_ip, dst_ip, sport, dport, message, checksum=checksum, beyond=beyond)
+    header = ipv4_header(src_ip, dst_ip, 17, len(segment), tos=0x10)
+    return dst_mac + src_mac + b"\x08\x00" + header + segment + beyond
+
+
+def dhcp_nak(xid, *, server=None, chaddr=GUEST_MAC, **kw):
+    """A NAK the way QEMU's DHCP server sends one: yiaddr 255.255.255.255 (it
+    fills yiaddr from the broadcast destination), option 56 with a reason, and
+    NO server identifier unless one is asked for here."""
+    options = bytes([53, 1, 6])
+    if server is not None:
+        options += bytes([54, 4]) + server
+    reason = b"requested address not available"
+    options += bytes([56, len(reason)]) + reason + b"\xff"
+    return dhcp_reply(xid, BROADCAST_IP, chaddr=chaddr, options=options, **kw)
+
+
+def serve_lease(frames, send, *, address=GUEST_IP, router=GATEWAY_IP, mask=MASK_24,
+                lease=LEASE_INFINITE, server=GATEWAY_IP, seconds=30.0, refused=None):
+    """Plays the DHCP server once: waits for the guest's DISCOVER, OFFERs
+    `address`, waits for the REQUEST, ACKs it. `frames(seconds)` yields frames
+    the guest sends; `send(frame)` delivers one. Returns (discover, request) as
+    dhcp_parse gives them, or raises RuntimeError. The lease is infinite by
+    default, so the guest has no reason to say anything unasked afterwards.
+
+    The OFFER and ACK are checksummed, as QEMU's are. With `refused` given, a
+    guest that ignores one -- no REQUEST after the OFFER, no ARP for the router
+    after the ACK -- is reported through refused("OFFER") or refused("ACK") and
+    sent it again with no checksum (UDP's 0), which a guest whose checksum
+    verification is broken still takes. A test suite can then report the lease
+    as failed and still run every case after it, rather than dying before its
+    first. Without `refused` nothing is retried: a refusal is a timeout."""
+    deadline = time.time() + seconds
+    patience = 2.0 if refused else seconds
+
+    def wait_for(accept, what, within):
+        until = min(deadline, time.time() + within)
+        while time.time() < until:
+            for f in frames(min(1.0, max(0.05, until - time.time()))):
+                if accept(f):
+                    return f
+        if within >= seconds:
+            raise RuntimeError(f"no {what} from the guest in {seconds:.0f} s")
+        return None
+
+    def dhcp(message_type, xid=None):
+        def accept(f):
+            if not is_dhcp_from_guest(f):
+                return False
+            parsed = dhcp_parse(f)
+            return parsed["type"] == message_type and (xid is None or parsed["xid"] == xid)
+        return accept, f"DHCP {DHCP_TYPES[message_type]}"
+
+    def router_arp(f):
+        return (len(f) >= 42 and f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x01"
+                and f[38:42] == router[:4])
+
+    def serve(reply, expect, what, answer):
+        """Sends `reply`; if nothing `expect`ed comes, reports it and sends it
+        again unchecksummed. Returns the frame that answered."""
+        send(reply())
+        got = wait_for(expect[0], expect[1], patience)
+        if got is None:
+            refused(answer)
+            send(reply(checksum=0))
+            got = wait_for(expect[0], expect[1], seconds)
+        return got
+
+    discover = dhcp_parse(wait_for(*dhcp(1), seconds))
+    xid, chaddr = discover["xid"], discover["chaddr"][:6]
+    terms = dict(chaddr=chaddr, server=server, mask=mask, router=router, lease=lease)
+
+    request = dhcp_parse(serve(lambda **kw: dhcp_reply(xid, address, **terms, **kw),
+                               dhcp(3, xid), "DHCP REQUEST", "OFFER"))
+    ack = lambda **kw: dhcp_reply(xid, address, message_type=5, **terms, **kw)
+    if refused and router is not None:
+        serve(ack, (router_arp, "ARP for the router"), "ARP", "ACK")
+    else:
+        send(ack())
+    return discover, request
+
+
+def arp_request(target=GUEST_IP):
+    """who-has `target` (10.0.2.15 by default), tell 10.0.2.2 -- the gateway
+    asking for THIS machine.
 
     The direction matters: an ARP request whose target IP is someone else is one
     the driver must ignore, so it proves nothing about the reply path. This asks
-    for 10.0.2.15, which is the address net_server answers to, so a correct
-    driver must transmit a reply and --listen will show it.
+    for the address the harness leased the guest, so a correct driver must
+    transmit a reply and --listen will show it.
     """
     return (b"\x00\x01"                          # hardware type: Ethernet
             b"\x08\x00"                          # protocol type: IPv4
             b"\x06\x04"                          # hardware length 6, protocol length 4
             b"\x00\x01"                          # opcode: request
-            + GATEWAY_MAC + bytes([10, 0, 2, 2])      # sender: the gateway
-            + b"\x00\x00\x00\x00\x00\x00" + bytes([10, 0, 2, 15]))  # target: us, MAC unknown
+            + GATEWAY_MAC + GATEWAY_IP              # sender: the gateway
+            + b"\x00\x00\x00\x00\x00\x00" + target)   # target: us, MAC unknown
 
 
 def arp_request_elsewhere():
     """who-has 10.0.2.99 -- an address this machine does not own. Must be ignored."""
     return (b"\x00\x01\x08\x00\x06\x04\x00\x01"
-            + GATEWAY_MAC + bytes([10, 0, 2, 2])
+            + GATEWAY_MAC + GATEWAY_IP
             + b"\x00\x00\x00\x00\x00\x00" + bytes([10, 0, 2, 99]))
 
 
@@ -337,9 +611,9 @@ def listen(sock, seconds):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=52139)
+    ap.add_argument("--monitor", required=True,
+                    help="QEMU monitor socket: QEMU starts paused (-S) and is resumed from here")
     ap.add_argument("--count", type=int, default=4)
-    ap.add_argument("--delay", type=float, default=4.0,
-                    help="seconds to wait for the driver to bring the card up")
     ap.add_argument("--gap", type=float, default=0.4, help="seconds between frames")
     ap.add_argument("--kinds", default=",".join(DEFAULT_CYCLE))
     ap.add_argument("--listen", type=float, default=0.0,
@@ -353,10 +627,6 @@ def main():
             print(f"unknown frame kind '{kind}'; known: {', '.join(FRAME_KINDS)}", file=sys.stderr)
             return 2
 
-    # The card is only listening once the driver has reset it and set RE, so
-    # frames sent before that are dropped on the floor by the device model.
-    time.sleep(args.delay)
-
     try:
         sock = socket.create_connection(("127.0.0.1", args.port), timeout=5)
     except OSError as e:
@@ -364,6 +634,17 @@ def main():
         return 1
 
     with sock:
+        # Resume the paused guest only now that QEMU has a peer for the card,
+        # then be its DHCP server: until it has an address it answers nothing.
+        Monitor(args.monitor, 10.0).start_guest()
+        reader = FrameReader(sock)
+        try:
+            serve_lease(reader.frames, lambda f: sock.sendall(struct.pack(">I", len(f)) + f))
+        except RuntimeError as e:
+            print(f"the guest never leased an address: {e}", file=sys.stderr)
+            return 1
+        print("leased 10.0.2.15 to the guest by DHCP")
+        time.sleep(0.5)
         for i in range(args.count):
             kind = kinds[i % len(kinds)]
             frame = ethernet_frame(kind)

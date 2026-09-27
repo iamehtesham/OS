@@ -29,4 +29,11 @@ uint16_t ntohs(uint16_t value);
 uint32_t htonl(uint32_t value);
 uint32_t ntohl(uint32_t value);
 
+/* A big-endian 32-bit value read out of, or written into, bytes at any
+ * address -- for fields that are not in a struct, like a DHCP option's data,
+ * which can start at any offset and so cannot be read through a uint32_t *.
+ * The load returns a HOST-order number; the store takes one. */
+uint32_t net_load_be32(const uint8_t *bytes);
+void     net_store_be32(uint8_t *bytes, uint32_t value);
+
 #endif /* NET_BYTEORDER_H */

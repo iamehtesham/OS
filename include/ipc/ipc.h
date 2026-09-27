@@ -29,6 +29,9 @@ _Static_assert(sizeof(ipc_message_t) == 44, "ipc_message_t layout changed");
  * with the IRQ line number as a little-endian word in data[0..3]. */
 #define MSG_HARDWARE_INTERRUPT 1u
 
+/* A task's alarm (SYS_ALARM) has expired. The payload is all zero. */
+#define MSG_TIMER 2u
+
 /* The input protocol. Three programs speak it -- the keyboard driver, the input
  * server and every application that wants keys -- so it lives here rather than
  * in a pairwise header. Payload layouts are in ipc/input_proto.h. */
@@ -65,5 +68,12 @@ struct task;
  * happened to fill the driver's single slot first. Wakes a blocked target.
  * Returns false if the target cannot receive. */
 bool ipc_notify_irq(struct task *target, uint8_t irq);
+
+/* Kernel-side, from the timer tick: expires every alarm whose deadline has
+ * passed. Each becomes a pending flag -- like a forwarded interrupt, a flag and
+ * not a message, so nothing another process sends can crowd it out -- which
+ * recv turns into a MSG_TIMER, and a task blocked in recv is woken. Runs with
+ * interrupts masked, touches only control blocks, never user memory. */
+void ipc_expire_alarms(uint32_t now);
 
 #endif /* IPC_IPC_H */

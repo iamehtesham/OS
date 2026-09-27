@@ -145,8 +145,24 @@ char *u_append_hex(char *out, const char *limit, uint32_t value);
 uint32_t u_load32(const uint8_t *from);
 void     u_store32(uint8_t *to, uint32_t value);
 
-/* Busy-waits. hlt is privileged, so a ring-3 program has no other way to pace
- * itself; the timer still preempts this. */
+/* Busy-waits. hlt is privileged; a program that wants to wait for a time
+ * rather than burn one uses u_alarm and recv instead. The timer still preempts
+ * this. */
 void u_spin(uint32_t iterations);
+
+/* Arms this process's alarm: after `ticks` timer ticks (SYS_ALARM_HZ a second)
+ * its next recv returns a MSG_TIMER from the kernel pid. 0 cancels. Arming or
+ * cancelling also discards an expiry not yet collected. False, with nothing
+ * changed, for SYS_ALARM_MAX_TICKS + 1 or more. */
+bool u_alarm(uint32_t ticks);
+
+/* Timer ticks since boot, SYS_ALARM_HZ a second; wraps at 2^32, so compare
+ * readings by signed difference. */
+uint32_t u_ticks(void);
+
+/* The CPU's timestamp counter. Not a clock -- its rate is whatever the CPU (or
+ * QEMU) makes it -- but it differs from boot to boot, which is what a
+ * transaction id needs. */
+uint64_t u_rdtsc(void);
 
 #endif /* USER_ULIB_H */

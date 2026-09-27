@@ -354,3 +354,30 @@ void u_spin(uint32_t iterations)
     for (volatile uint32_t i = 0; i < iterations; i++) {
     }
 }
+
+bool u_alarm(uint32_t ticks)
+{
+    int32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_ALARM), "b"(ticks) : "memory");
+
+    return result == 0;
+}
+
+uint32_t u_ticks(void)
+{
+    uint32_t result;
+
+    __asm__ volatile ("int $0x80" : "=a"(result) : "a"(SYS_TICKS) : "memory");
+
+    return result;
+}
+
+uint64_t u_rdtsc(void)
+{
+    uint32_t low, high;
+
+    __asm__ volatile ("rdtsc" : "=a"(low), "=d"(high));
+
+    return ((uint64_t)high << 32) | low;
+}

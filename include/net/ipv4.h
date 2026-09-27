@@ -76,35 +76,42 @@ _Static_assert(__builtin_offsetof(ipv4_header_t, dest_ip) == 16u, "dest_ip at 16
 #define NET_IPV4(a, b, c, d)                                                          \
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 
-/* This machine's address, its subnet, and the gateway. Hardcoded because there
- * is no DHCP client: they are what QEMU's user-mode network hands out and
- * answers to. They lived in arp.h while ARP was their only reader. */
-#define NET_LOCAL_IP         NET_IPV4(10, 0, 2, 15)
-#define NET_GATEWAY_IP       NET_IPV4(10, 0, 2, 2)
-#define NET_NETMASK          NET_IPV4(255, 255, 255, 0)
-#define NET_SUBNET_BROADCAST ((NET_LOCAL_IP & NET_NETMASK) | (~NET_NETMASK & 0xFFFFFFFFu))
+/* The limited broadcast: every host on this link. This machine's own address,
+ * mask and router are no longer constants here -- they were, 10.0.2.15/24 via
+ * 10.0.2.2, until DHCP (dhcp.c) could lease them. They live in net/netcfg.h. */
+#define NET_BROADCAST_IP NET_IPV4(255, 255, 255, 255)
 
 /* Appends a dotted quad from a HOST-order address. In src/user/lib/net.c. */
 char *net_append_ipv4(char *out, const char *limit, uint32_t address);
 
 /* Looks at one received frame carrying EtherType 0x0800. Validates the IPv4
  * header -- every check reads only bytes an earlier check proved are there --
- * and hands what is inside a datagram addressed to this machine to the protocol
- * that speaks it: ICMP to icmp_receive, UDP to udp_receive. Anything else is
- * reported and dropped. `frame` points at the Ethernet header, and `frame_bytes`
- * is the frame's length without the card's CRC. In src/user/net_server/ipv4.c. */
+ * and hands what is inside to the protocol that speaks it: ICMP to
+ * icmp_receive, UDP to udp_receive. Two kinds of datagram get that far: one
+ * addressed to this machine's leased address at this card's MAC, once a lease
+ * is bound; and a UDP datagram to the limited broadcast 255.255.255.255, which
+ * UDP then gives only to DHCP. Anything else is reported and dropped. `frame`
+ * points at the Ethernet header, and `frame_bytes` is the frame's length
+ * without the card's CRC. In src/user/net_server/ipv4.c. */
 void ipv4_receive(const uint8_t *frame, uint32_t frame_bytes);
 
-/* Writes the IPv4 header of a reply to `request` at `out` and returns where the
- * reply's payload starts. The header is built fresh, never copied: IHL 5 (the
- * request's options belong to its journey, a source route among them), the
- * request's DSCP with ECN cleared, the next identification number, no flags,
- * TTL 64, from this machine's own address to the request's source, and a
- * checksum computed with its field zeroed first. `payload_bytes` is the length
- * of what follows the header. Shared by every protocol that answers, so their
- * replies are built one way and draw their identification numbers from one
- * counter, which repeats only when it wraps at 65,536. In
+/* Writes an IPv4 header at `out` and returns where the payload starts. Built
+ * fresh: IHL 5, the given TOS, the next identification number, no flags, TTL
+ * 64, and a checksum computed with its field zeroed first. `src` and `dst` are
+ * in NETWORK order -- an address copied out of a received header goes straight
+ * in, never swapped there and back. `payload_bytes` is the length of what
+ * follows. Every datagram this machine sends is built here, replies and the
+ * ones it originates (DHCP) alike, so they draw their identification numbers
+ * from one counter, which repeats only when it wraps at 65,536. In
  * src/user/net_server/ipv4.c. */
+uint8_t *ipv4_write_header(uint8_t *out, uint32_t src, uint32_t dst, uint8_t protocol,
+                           uint8_t tos, uint32_t payload_bytes);
+
+/* The header of a reply to `request`: from this machine's leased address to
+ * the request's source, with the request's DSCP and ECN cleared. The request's
+ * options belong to its journey, a source route among them, and are not
+ * copied. Only ever called once a lease is bound -- nothing unbound gets far
+ * enough to be answered. */
 uint8_t *ipv4_write_reply_header(uint8_t *out, const ipv4_header_t *request, uint8_t protocol,
                                  uint32_t payload_bytes);
 

@@ -10,7 +10,9 @@
  * until the header's own length has been checked against the datagram's.
  *
  * Nothing is reassembled and nothing is routed. A fragment is dropped -- there
- * is no reassembly buffer -- and so is any datagram not addressed to 10.0.2.15.
+ * is no reassembly buffer -- and so is any datagram not addressed to the
+ * address DHCP leased this machine, apart from the UDP broadcasts DHCP itself
+ * arrives in. Before a lease there is no address, and nothing is answered.
  * The card is promiscuous, but by the time a frame reaches this file
  * handle_ethernet has already kept only those sent to this card's MAC or to the
  * broadcast MAC, so what arrives here was at least addressed to this machine at
@@ -25,6 +27,7 @@
 #include "net/ethernet.h"
 #include "net/icmp.h"
 #include "net/ipv4.h"
+#include "net/netcfg.h"
 #include "net/rtl8139.h"
 #include "net/udp.h"
 #include "user/ulib.h"
@@ -98,13 +101,22 @@ static const char *bad_source(uint32_t source, const uint8_t *source_mac)
         return "the source is in 0.0.0.0/8";
     }
 
-    if (source == 0xFFFFFFFFu || source == NET_SUBNET_BROADCAST) {
+    if (source == NET_BROADCAST_IP) {
         return "the source is a broadcast address";
+    }
+
+    /* The rest depend on knowing which subnet this machine is on, and so apply
+     * only once a lease says -- before that there is no subnet to have a
+     * broadcast address, and no address of our own to be impersonated. */
+    const net_config_t *const config = net_config();
+
+    if (config->bound && source == net_config_broadcast()) {
+        return "the source is the subnet's broadcast address";
     }
 
     /* The subnet's own address -- host part all zeroes. Not a host; older
      * stacks treat it as a broadcast. */
-    if (source == (NET_LOCAL_IP & NET_NETMASK)) {
+    if (config->bound && source == net_config_network()) {
         return "the source is the subnet's network address";
     }
 
@@ -120,7 +132,7 @@ static const char *bad_source(uint32_t source, const uint8_t *source_mac)
         return "the source is in the reserved 240/4 range";
     }
 
-    if (source == NET_LOCAL_IP) {
+    if (config->bound && source == config->address) {
         return "the source claims to be this machine";
     }
 
@@ -198,20 +210,47 @@ void ipv4_receive(const uint8_t *frame, uint32_t frame_bytes)
         return;
     }
 
-    /* 8. Addressed to this machine, at both layers. handle_ethernet has already
-     *    passed only frames for this card's MAC or for broadcast, so the MAC
-     *    test here exists to refuse the second kind: a datagram for 10.0.2.15
-     *    that arrived as a link-layer broadcast. RFC 1122 (3.2.2.6) lets a host
-     *    decline to answer an echo request sent to a broadcast address, and a
-     *    host that answers them is one half of every broadcast-ping flood. */
-    if (ntohl(ip->dest_ip) != NET_LOCAL_IP) {
-        drop("addressed to another machine");
-        return;
-    }
+    /* 8. Addressed to this machine -- or to everyone, for DHCP.
+     *
+     *    A limited broadcast (255.255.255.255) is how a DHCP server reaches a
+     *    machine that has no address yet, so it is let through, but only for
+     *    UDP, and udp_receive gives it only to the DHCP client's port. Nothing
+     *    else here ever answers a broadcast: RFC 1122 (3.2.2.6) lets a host
+     *    decline to answer an echo request sent to one, and a host that does is
+     *    one half of every broadcast-ping flood. handle_ethernet has already
+     *    kept only frames for this card's MAC or the broadcast MAC, which is
+     *    all a broadcast needs.
+     *
+     *    Anything else needs a lease -- an address this machine has not been
+     *    given is not one it may answer for, 0.0.0.0 included -- and must be
+     *    for that address at this card's MAC: a datagram for us that arrived as
+     *    a link-layer broadcast is refused for the same flood reason. */
+    const uint32_t            destination = ntohl(ip->dest_ip);
+    const net_config_t *const config      = net_config();
+    bool                      broadcast   = false;
 
-    if (!mac_equal(eth->dst_mac, rtl8139_mac())) {
-        drop("not sent to this card's MAC address");
-        return;
+    if (destination == NET_BROADCAST_IP) {
+        if (ip->protocol != IPV4_PROTOCOL_UDP) {
+            drop("a broadcast, and only UDP may be broadcast to this machine");
+            return;
+        }
+
+        broadcast = true;
+    } else {
+        if (!config->bound) {
+            drop("no address has been leased yet");
+            return;
+        }
+
+        if (destination != config->address) {
+            drop("addressed to another machine");
+            return;
+        }
+
+        if (!mac_equal(eth->dst_mac, rtl8139_mac())) {
+            drop("not sent to this card's MAC address");
+            return;
+        }
     }
 
     /* 9. From a single, ordinary host. */
@@ -235,7 +274,7 @@ void ipv4_receive(const uint8_t *frame, uint32_t frame_bytes)
     }
 
     if (ip->protocol == IPV4_PROTOCOL_UDP) {
-        udp_receive(eth, ip, payload, payload_bytes);
+        udp_receive(eth, ip, payload, payload_bytes, broadcast);
         return;
     }
 
@@ -254,20 +293,20 @@ void ipv4_receive(const uint8_t *frame, uint32_t frame_bytes)
     u_print(line);
 }
 
-uint8_t *ipv4_write_reply_header(uint8_t *out, const ipv4_header_t *request, uint8_t protocol,
-                                 uint32_t payload_bytes)
+uint8_t *ipv4_write_header(uint8_t *out, uint32_t src, uint32_t dst, uint8_t protocol,
+                           uint8_t tos, uint32_t payload_bytes)
 {
     ipv4_header_t *const header = (ipv4_header_t *)out;
 
     header->version_ihl    = (uint8_t)((4u << 4) | (IPV4_HEADER_SIZE / 4u));
-    header->tos            = (uint8_t)(request->tos & IPV4_TOS_DSCP_MASK);
+    header->tos            = tos;
     header->total_length   = htons((uint16_t)(IPV4_HEADER_SIZE + payload_bytes));
     header->id             = htons(next_datagram_id++);
     header->flags_fragment = 0;
     header->ttl            = IPV4_DEFAULT_TTL;
     header->protocol       = protocol;
-    header->src_ip         = htonl(NET_LOCAL_IP);
-    header->dest_ip        = request->src_ip; /* network order in, network order out */
+    header->src_ip         = src; /* network order in, network order out */
+    header->dest_ip        = dst;
 
     /* The checksum field is zeroed FIRST, then the checksum is computed over
      * the header, then stored. The checksum is defined over the header with
@@ -278,4 +317,11 @@ uint8_t *ipv4_write_reply_header(uint8_t *out, const ipv4_header_t *request, uin
     header->checksum = htons(net_checksum(header, IPV4_HEADER_SIZE));
 
     return out + IPV4_HEADER_SIZE;
+}
+
+uint8_t *ipv4_write_reply_header(uint8_t *out, const ipv4_header_t *request, uint8_t protocol,
+                                 uint32_t payload_bytes)
+{
+    return ipv4_write_header(out, htonl(net_config()->address), request->src_ip, protocol,
+                             (uint8_t)(request->tos & IPV4_TOS_DSCP_MASK), payload_bytes);
 }

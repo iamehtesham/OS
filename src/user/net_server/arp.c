@@ -4,11 +4,13 @@
  * before it listened: the card was brought up, packets were read out of a DMA
  * ring, headers were parsed and printed. ARP is where the machine answers.
  *
- * It answers exactly one question -- "who has 10.0.2.15?" -- with exactly one
- * fact: this card's MAC address. There is no ARP cache: the IP layer above it
- * only ever replies, addressing each reply to the MAC the request came from, so
- * nothing looks an address up, and caching answers nobody reads would be
- * storing work for its own sake. */
+ * It answers exactly one question -- "who has <the address DHCP leased us>?"
+ * -- with exactly one fact: this card's MAC address, and only once a lease is
+ * bound; before that the machine has no address to answer for. There is no ARP
+ * cache: every reply the layers above send goes back to the MAC its request
+ * came from, and what the machine originates -- DHCP, and the one question it
+ * asks here, for its router -- is broadcast, so nothing looks an address up,
+ * and caching answers nobody reads would be storing work for its own sake. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +19,7 @@
 #include "net/byteorder.h"
 #include "net/ethernet.h"
 #include "net/ipv4.h"
+#include "net/netcfg.h"
 #include "net/rtl8139.h"
 #include "user/ulib.h"
 
@@ -61,7 +64,7 @@ static void send_reply(const arp_header_t *request)
      * bytes; the IP is a number and needs htonl, or the far end reads 15.2.0.10
      * and throws the reply away. */
     u_memcpy(reply->sender_mac, our_mac, ETH_ALEN);
-    reply->sender_ip = htonl(NET_LOCAL_IP);
+    reply->sender_ip = htonl(net_config()->address);
 
     /* And the asker is the target. Its address fields are copied straight from
      * the request, still in network order -- converting them to host order and
@@ -77,7 +80,7 @@ static void send_reply(const arp_header_t *request)
         char       *out   = line;
 
         out = u_append(out, limit, "  [net] ARP reply sent: ");
-        out = net_append_ipv4(out, limit, NET_LOCAL_IP);
+        out = net_append_ipv4(out, limit, net_config()->address);
         out = u_append(out, limit, " is at ");
         out = net_append_mac(out, limit, our_mac);
         out = u_append(out, limit, "\n");
@@ -141,11 +144,25 @@ void arp_receive(const uint8_t *frame, uint32_t frame_bytes)
     }
 
     /* The comparison that decides whether to answer. Both sides are in host
-     * order -- the field was converted above, the constant was written that
-     * way. Comparing the raw field against the constant would silently never
-     * match, which looks exactly like a network that is not asking. */
-    if (target_ip != NET_LOCAL_IP) {
-        return; /* someone else's address; not ours to answer for */
+     * order -- the field was converted above, the lease is kept that way.
+     * Comparing the raw field against it would silently never match, which
+     * looks exactly like a network that is not asking. And only with a lease:
+     * unbound, the "address" is 0.0.0.0, and a request for 0.0.0.0 is another
+     * host's probe, not a question for us. */
+    const net_config_t *const config = net_config();
+
+    if (!config->bound || target_ip != config->address) {
+        return; /* no address yet, or someone else's; not ours to answer for */
+    }
+
+    /* The reply goes to the MAC the request names as its sender. A group
+     * address there -- broadcast or multicast, the low bit of the first octet
+     * -- would turn one request into a reply to every station on the segment,
+     * and no single host has one: ipv4.c refuses a group source MAC for the
+     * same reason. */
+    if ((arp->sender_mac[0] & 0x01u) != 0u) {
+        u_print("  [net] ARP request from a group MAC address; not answering it\n");
+        return;
     }
 
     send_reply(arp);
@@ -166,7 +183,7 @@ bool arp_request(uint32_t target_ip)
     write_arp_common(arp, ARP_REQUEST);
 
     u_memcpy(arp->sender_mac, our_mac, ETH_ALEN);
-    arp->sender_ip = htonl(NET_LOCAL_IP);
+    arp->sender_ip = htonl(net_config()->address);
 
     /* The target MAC is what is being asked for, so it goes out as zeroes --
      * the blank in the question. */
@@ -186,7 +203,7 @@ bool arp_request(uint32_t target_ip)
     out = u_append(out, limit, "  [net] ARP request sent: who has ");
     out = net_append_ipv4(out, limit, target_ip);
     out = u_append(out, limit, "? tell ");
-    out = net_append_ipv4(out, limit, NET_LOCAL_IP);
+    out = net_append_ipv4(out, limit, net_config()->address);
     out = u_append(out, limit, "\n");
     *out = '\0';
 

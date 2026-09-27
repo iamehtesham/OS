@@ -105,16 +105,56 @@ bool ipc_notify_irq(struct task *target, uint8_t irq)
     return true;
 }
 
-/* Builds the message a pending interrupt is delivered as. The kernel is the
- * sender, and says so with a pid no user program can be stamped with. */
-static void irq_message(ipc_message_t *note, uint32_t receiver_pid, uint8_t irq)
+void ipc_expire_alarms(uint32_t now)
+{
+    task_t *const first = task_current();
+
+    if (first == NULL) {
+        return;
+    }
+
+    /* Every task in the ring, once. The ring cannot change underneath: this
+     * runs from the timer interrupt, whose gate cleared IF, and every unlink
+     * happens with interrupts off. Zombies and tasks that cannot receive are
+     * skipped for the reason ipc_notify_irq skips them -- nothing would ever
+     * collect the flag. */
+    task_t *t = first;
+
+    do {
+        /* Signed difference, so the tick counter wrapping (after about 497
+         * days at 100 Hz) does not make a deadline past the wrap look already
+         * due: compared unsigned, a deadline that wrapped to a small number is
+         * behind every tick before the wrap. Valid because no alarm is ever
+         * armed for 2^31 ticks or more. make dhcp boots a kernel whose counter
+         * starts just short of the wrap to prove it. */
+        if (t->alarm_armed && t->can_receive && t->state != TASK_ZOMBIE &&
+            (int32_t)(now - t->alarm_deadline) >= 0) {
+            t->alarm_armed   = false;
+            t->alarm_pending = true;
+
+            if (t->state == TASK_BLOCKED) {
+                t->state = TASK_RUNNING;
+            }
+        }
+
+        t = t->next;
+    } while (t != first);
+}
+
+/* Builds a message the kernel itself sends -- a forwarded interrupt or an
+ * expired alarm. Zeroed whole first: it is built on the kernel stack and copied
+ * out to ring 3, and every byte of the payload not set here would otherwise be
+ * whatever the kernel stack held. The kernel is the sender, and says so with a
+ * pid no user program can be stamped with. */
+static void kernel_message(ipc_message_t *note, uint32_t receiver_pid, uint32_t type,
+                           uint8_t low_byte)
 {
     kmemset(note, 0, sizeof(*note));
 
     note->sender_pid   = IPC_KERNEL_PID;
     note->receiver_pid = receiver_pid;
-    note->type         = MSG_HARDWARE_INTERRUPT;
-    note->data[0]      = irq; /* the low byte of a little-endian word; the rest is zero */
+    note->type         = type;
+    note->data[0]      = low_byte; /* the low byte of a little-endian word; the rest is zero */
 }
 
 int32_t ipc_recv(uint32_t user_msg)
@@ -133,14 +173,32 @@ int32_t ipc_recv(uint32_t user_msg)
     }
 
     /* A loop, not an if: schedule() returns whenever something switches back
-     * to this task, and only a sender or an interrupt is a reason to stop
-     * waiting. Anything else re-blocks. */
-    while (!self->mailbox_full && !self->trusted_mailbox_full && self->pending_irqs == 0) {
+     * to this task, and only a sender, an interrupt or an alarm is a reason to
+     * stop waiting. Anything else re-blocks. */
+    while (!self->mailbox_full && !self->trusted_mailbox_full && self->pending_irqs == 0 &&
+           !self->alarm_pending) {
         self->state = TASK_BLOCKED;
         schedule();
     }
 
-    /* Hardware first. A driver that has both a message and an interrupt
+    /* An expired alarm before anything else, interrupts included. It is
+     * one-shot and costs its owner one pass of the loop, so it can never starve
+     * a device; the other way round, a busy device re-raising its line would
+     * postpone the alarm for as long as traffic kept arriving. This order only
+     * helps a task that comes back to recv, though: one kept away from it --
+     * the network server, draining a ring a flood keeps full -- has to ask for
+     * itself, and does, against SYS_TICKS. */
+    if (self->alarm_pending) {
+        self->alarm_pending = false;
+
+        ipc_message_t note;
+
+        kernel_message(&note, self->pid, MSG_TIMER, 0);
+
+        return copy_to_user(user_msg, &note, (uint32_t)sizeof(note)) ? IPC_OK : IPC_ERR_FAULT;
+    }
+
+    /* Then hardware. A driver that has both a message and an interrupt
      * waiting has a device sitting on a masked line, and the message can wait
      * a round trip; the device cannot be made to. Lowest line first, which is
      * also the 8259's own priority order. */
@@ -158,7 +216,7 @@ int32_t ipc_recv(uint32_t user_msg)
 
         ipc_message_t note;
 
-        irq_message(&note, self->pid, irq);
+        kernel_message(&note, self->pid, MSG_HARDWARE_INTERRUPT, irq);
 
         return copy_to_user(user_msg, &note, (uint32_t)sizeof(note)) ? IPC_OK : IPC_ERR_FAULT;
     }

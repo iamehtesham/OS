@@ -83,8 +83,11 @@ void *kmalloc(uint32_t size)
          * also what makes an exact fit work without a special case: there is
          * simply nothing left to split. */
         if (block->size >= needed + HEADER_SIZE + KHEAP_ALIGNMENT) {
+            /* Through void *: the byte arithmetic loses the type's alignment,
+             * but block, HEADER_SIZE and needed are all multiples of
+             * KHEAP_ALIGNMENT, so the result is aligned. */
             struct kheap_block *const rest =
-                (struct kheap_block *)((uint8_t *)block + HEADER_SIZE + needed);
+                (struct kheap_block *)(void *)((uint8_t *)block + HEADER_SIZE + needed);
 
             rest->magic   = KHEAP_MAGIC;
             rest->size    = block->size - needed - HEADER_SIZE;
@@ -120,8 +123,15 @@ void kfree(void *ptr)
         return;
     }
 
+    /* Every payload kmalloc returns is KHEAP_ALIGNMENT-aligned, so a pointer
+     * that is not is no payload -- and its header would be misaligned. */
+    if ((address - KHEAP_VIRTUAL_BASE) % KHEAP_ALIGNMENT != 0u) {
+        klog("kfree: %p is not a payload address\n", ptr);
+        return;
+    }
+
     struct kheap_block *const block =
-        (struct kheap_block *)((uint8_t *)ptr - HEADER_SIZE);
+        (struct kheap_block *)(void *)((uint8_t *)ptr - HEADER_SIZE);
 
     if (block->magic != KHEAP_MAGIC) {
         klog("kfree: %p has no valid header\n", ptr);

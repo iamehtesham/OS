@@ -90,6 +90,9 @@ static task_t *task_alloc(void)
     task->may_use_io       = false;
     task->may_map_vga      = false;
     task->pending_irqs     = 0;
+    task->alarm_deadline   = 0;
+    task->alarm_armed      = false;
+    task->alarm_pending    = false;
 
     task->shm_next_vaddr = SHM_WINDOW_BASE;
     task->dma_next_vaddr = DMA_WINDOW_BASE;

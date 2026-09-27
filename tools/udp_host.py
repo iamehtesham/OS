@@ -12,8 +12,9 @@ guest as coming from 10.0.2.2, and the guest's reply is carried back to the
 sender's socket. So this is the whole path: host socket, a real UDP/IP stack
 this project did not write, the card, the guest, and back.
 
-What it proves: addressing, the port swap, the length and the data survive a
-real stack in both directions. What it does NOT prove is that the guest
+What it proves: the guest leases its address from QEMU's own DHCP server --
+the console is checked for the lease line first -- and addressing, the port
+swap, the length and the data survive a real stack in both directions. What it does NOT prove is that the guest
 computes its checksum -- libslirp skips the check when the checksum is 0 and
 always stamps a valid checksum on what it sends the guest, and the correct
 reply checksum equals the request's. That is make udp's job, whose requests can
@@ -43,7 +44,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import udp_echo  # noqa: E402 -- its Monitor and its preview rules
+import inject_frames as wire  # noqa: E402 -- its Monitor
+import udp_echo  # noqa: E402 -- its preview rules
 
 LINE = b"hello from the host\n"
 
@@ -92,6 +94,25 @@ def main():
         print(f"  FAIL {name}: {why}")
         failures.append(name)
 
+    # First, before anything is sent: QEMU's own DHCP server leases the guest
+    # its address, and the lease line must be read off the console now, while
+    # it is still on the screen -- every probe below scrolls it further up.
+    monitor = None
+    if args.monitor:
+        monitor = wire.Monitor(args.monitor, args.wait)
+        deadline = time.time() + args.wait
+        leased = False
+        while time.time() < deadline and not leased:
+            monitor.command("sendkey esc")    # show the system console, where [net] logs
+            time.sleep(0.5)
+            leased = "  [net] DHCP Lease Acquired: 10.0.2.15" in monitor.screen()
+        if leased:
+            print("  ok   the guest's console: '[net] DHCP Lease Acquired: 10.0.2.15',"
+                  " leased by QEMU's own DHCP server")
+        else:
+            fail("the guest leased 10.0.2.15 from QEMU's DHCP server",
+                 "no lease line on the console")
+
     probes = wait_for_guest(args.port, args.wait)
     if not probes:
         print(f"nothing came back from 127.0.0.1:{args.port} in {args.wait:.0f} s")
@@ -99,12 +120,6 @@ def main():
     received += 1
     print(f"UDP to 127.0.0.1:{args.port}, forwarded by QEMU to 10.0.2.15:7; "
           f"the guest answered probe {probes}\n")
-
-    monitor = None
-    if args.monitor:
-        monitor = udp_echo.Monitor(args.monitor, args.wait)
-        monitor.command("sendkey esc")        # show the system console, where [net] logs
-        time.sleep(0.5)
 
     # The host's own netcat. -p: from a source port chosen here, so the guest's
     # log line can be checked for it. -W1: exit once one datagram has come

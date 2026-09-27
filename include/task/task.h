@@ -121,6 +121,15 @@ typedef struct task {
      * interrupt by filling its single message slot. */
     uint16_t pending_irqs;
 
+    /* The one alarm this task may have set with SYS_ALARM. Armed with a
+     * deadline in timer ticks; when the tick passes it, the alarm disarms and
+     * becomes pending, which recv delivers as a MSG_TIMER. Pending is a flag
+     * for the same reason pending_irqs is: an alarm is an event, and no other
+     * process may be able to make the task miss it by filling a slot. */
+    uint32_t alarm_deadline;
+    bool     alarm_armed;
+    bool     alarm_pending;
+
     /* The process that created this one with SYS_SPAWN, or 0 for a process
      * the kernel started at boot. The console puts a child's output where its
      * parent's goes, and sys_waitpid uses it to enforce that only a parent may

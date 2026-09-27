@@ -10,9 +10,10 @@
  * The reply is built fresh in its own buffer, never edited in place in the
  * receive ring, and it is addressed from this machine's own identity rather
  * than by swapping the request's addresses around. For a request unicast to
- * 10.0.2.15 those come to the same thing; the difference is in what the swap
- * would copy blindly. Only echo requests are answered: an inbound echo REPLY
- * is not, so two machines cannot bounce replies off each other forever. */
+ * the leased address those come to the same thing; the difference is in what
+ * the swap would copy blindly. Only echo requests are answered: an inbound
+ * echo REPLY is not, so two machines cannot bounce replies off each other
+ * forever. */
 
 #include <stdbool.h>
 #include <stdint.h>

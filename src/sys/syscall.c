@@ -5,6 +5,7 @@
 #include "cpu/irq.h"
 #include "cpu/isr.h"
 #include "cpu/pic.h"
+#include "drivers/pit.h"
 #include "ipc/ipc.h"
 #include "mm/kheap.h"
 #include "mm/paging.h"
@@ -487,6 +488,33 @@ static int32_t sys_unmask_irq(uint32_t irq)
     return 0;
 }
 
+/* Arms, re-arms or cancels the caller's alarm. Validated before anything is
+ * touched, so a refused call leaves a pending expiry exactly as it was. Then
+ * any expiry that fired but was never collected is discarded: the caller has
+ * just said what it wants from now on, and an old timer arriving after a cancel
+ * or a re-arm would be a lie about the new one. Only the caller's own control
+ * block changes, so there is nothing to gate. */
+static int32_t sys_alarm(uint32_t ticks)
+{
+    task_t *const self = task_current();
+
+    if (self == NULL || ticks > SYS_ALARM_MAX_TICKS) {
+        return -1;
+    }
+
+    self->alarm_pending = false;
+
+    if (ticks == 0) {
+        self->alarm_armed = false;
+        return 0;
+    }
+
+    self->alarm_deadline = pit_ticks() + ticks;
+    self->alarm_armed    = true;
+
+    return 0;
+}
+
 /* Names the sender whose messages to this task get the reserved slot. Nothing
  * to gate: a task deciding whom IT trusts changes only its own mailbox. A
  * message already waiting in the reserved slot from a previous trustee is
@@ -686,6 +714,14 @@ void syscall_handler(struct registers *regs)
 
     case SYS_CLAIM_IRQ:
         regs->eax = (uint32_t)sys_claim_irq(regs->ebx);
+        break;
+
+    case SYS_ALARM:
+        regs->eax = (uint32_t)sys_alarm(regs->ebx);
+        break;
+
+    case SYS_TICKS:
+        regs->eax = pit_ticks();
         break;
 
     case SYS_MAP_HW_BUFFER:

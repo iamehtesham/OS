@@ -10,7 +10,14 @@
  * binary counting. Bits are 00 11 011 0. */
 #define PIT_CMD_CHANNEL0_SQUAREWAVE 0x36
 
-static volatile uint32_t tick_count;
+/* Where the tick counter starts. 0, except in the kernel `make dhcp` builds
+ * to start a few seconds short of 2^32, so that alarms armed across the wrap
+ * are tested in minutes rather than after 497 days of uptime. */
+#ifndef PIT_FIRST_TICK
+#define PIT_FIRST_TICK 0u
+#endif
+
+static volatile uint32_t tick_count = PIT_FIRST_TICK;
 static uint32_t          configured_frequency;
 static pit_tick_t        tick_handler;
 

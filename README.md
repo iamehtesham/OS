@@ -27,7 +27,9 @@ memory, naming the Ethernet addresses and protocol inside each one,
 answering ARP for its own address, answering a ping — an ICMP echo request,
 checksums verified coming in and computed going out — and echoing UDP sent to
 port 7, whose checksum covers a pseudo-header of IP fields as well as the
-datagram, with the kernel never learning what a packet is. The kernel
+datagram — on an address it did not have when it booted, but leased by DHCP,
+with a kernel alarm to retransmit by — and with the kernel never learning what a
+packet is. The kernel
 starts six processes at boot and no more; a shell among them starts everything
 else from files in the filesystem image with `sys_spawn`, and the kernel
 validates every image before a byte of it runs.
@@ -41,8 +43,8 @@ gcc (with -m32 / multilib)   binutils (as, ld)   qemu-system-i386   make
 ```
 
 The network test targets also need `python3` (the tools under `tools/`) and
-`tcpdump` (`make ping`, `make udp` and `make udp-host` re-check every checksum
-the guest sent with it; reading a capture needs no privilege). `make udp-host`
+`tcpdump` (`make ping`, `make udp`, `make udp-host` and `make dhcp` re-check
+every checksum the guest sent with it; reading a capture needs no privilege). `make udp-host`
 and the `nc` step below need OpenBSD `netcat`, for its `-W` option.
 
 There is deliberately no `i686-elf` cross-compiler in the loop: the host GCC is
@@ -61,6 +63,8 @@ make netdemo    # boot it and feed the network card real Ethernet frames
 make ping       # boot it headless, ping it, and check every reply byte
 make udp        # boot it headless, send UDP to port 7, and check every echo
 make udp-host   # the host's own nc through QEMU's user network and a forward
+make dhcp       # play the DHCP server, and try to break the guest's client
+make warnings   # the strict warning gate at -O0 -O1 -O2 -O3 -Os, as errors
 make check      # validate the Multiboot 1 header with grub-file
 make screenshot # headless boot, dump the framebuffer to build/screen.ppm
 make clean
@@ -69,11 +73,13 @@ make clean
 QEMU implements the Multiboot loader itself, so `make qemu` boots the ELF
 directly — no GRUB, no ISO, no disk image is involved.
 
-`make qemu` attaches the network card to QEMU's user-mode network. The driver
-opens with an ARP request for the gateway and QEMU's stack answers it — press
-Esc and the console shows the request going out and the reply coming back. It
-also forwards UDP from the host to the guest's echo service, so while it runs,
-in another terminal:
+`make qemu` attaches the network card to QEMU's user-mode network. The machine
+boots with no address: the driver broadcasts a DHCP DISCOVER, QEMU's own DHCP
+server offers 10.0.2.15, and after the REQUEST and ACK the console shows
+`DHCP Lease Acquired: 10.0.2.15` — press Esc to see it — and then an ARP request
+for the router the lease named, and QEMU's stack answering it. It also forwards
+UDP from the host to the guest's echo service, so while it runs, in another
+terminal:
 
 ```bash
 nc -u 127.0.0.1 7007
@@ -84,7 +90,9 @@ Type a line and it comes back; press Esc in the QEMU window to watch it arrive
 Ctrl-D does not. Not `nc -u 10.0.2.15 7`: user-mode networking is NAT, the host
 routes 10.0.2.15 out through its own LAN router, and host port 7 needs
 privilege — so QEMU forwards `127.0.0.1:7007` to `10.0.2.15:7`, bound to
-loopback so nothing else on the LAN can reach it. Use `127.0.0.1` rather than
+loopback so nothing else on the LAN can reach it. (The forward names 10.0.2.15
+while the guest leases its address; they agree because QEMU's DHCP server gives
+10.0.2.15 to the first client it sees.) Use `127.0.0.1` rather than
 `localhost`, which may resolve to `::1`; leave out `-v`, which makes OpenBSD
 `nc` send probe datagrams first; and keep lines under 1472 bytes, beyond which
 the forward fragments them and the guest drops fragments. If port 7007 is taken
@@ -92,9 +100,9 @@ QEMU will not start: `make qemu UDP_ECHO_HOST_PORT=<other port>`.
 
 That gateway never sends an ARP request or a ping, though, and nothing
 malformed, and those reply paths need a peer that does. `make netdemo` boots
-the same machine with the card on a socket netdev instead, writes ARP, an ICMP
-echo request, a UDP echo, IPv4, IPv6 and unrecognised frames into it
-(`tools/inject_frames.py`), and reads back and decodes whatever the guest
+the same machine with the card on a socket netdev instead, plays the DHCP server
+so the guest has an address, then writes ARP, an ICMP echo request, a UDP echo,
+IPv4, IPv6 and unrecognised frames into it (`tools/inject_frames.py`), and reads back and decodes whatever the guest
 transmits — so each reply is checked as bytes on the wire rather than as a line
 on the guest's own console.
 
@@ -122,7 +130,41 @@ gate is stricter than ping's, because a UDP checksum of 0 is legal and means
 "none": every UDP frame the guest sent must read `udp sum ok`. `make udp-host`
 is the `nc` step above, headless: the host's own netcat through QEMU's
 user-mode network and a port forward of its own (7008), the guest's console
-checked for the datagram arriving, and a size sweep.
+checked first for the lease QEMU's DHCP server granted and then for the datagram
+arriving, and a size sweep. Every socket-netdev harness now starts QEMU paused,
+connects, and only then lets the guest run — the listening socket drops whatever
+the guest says before a peer is there, and its first word is a DISCOVER — and
+then plays the DHCP server before testing anything, because an unleased guest
+answers nothing. The lease is the first named case of `make ping` and `make
+udp`: the guest must take QEMU's checksummed OFFER and ACK. One that refuses
+them — as a broken checksum verifier would — fails that case and is leased again
+with no checksum (UDP's 0), so the rest of the run still reaches the cases
+written for what is broken. One that cannot be leased at all — a port read in
+the wrong byte order, 68 as 17408 — fails that case, and the run ends there.
+
+`make dhcp` is the client's own test (`tools/dhcp_test.py`): the harness is the
+only DHCP server on the guest's segment, and it runs three boots. The first
+walks a lease's whole life. It checks the DISCOVER field by field and times its
+backoff; proves the unleased machine answers nothing, not even at 0.0.0.0; sends
+OFFERs, ACKs and NAKs each broken in exactly one way — xid, hardware address,
+cookie, options that overrun, never end or run to 255 bytes, bad masks and
+addresses, a message the state is not waiting for, a lease already over — and
+requires every one refused, starting a client that wrongly takes one afresh
+(NAKed, or left to lose that ACK's two-second lease) so the next case meets a
+client in the state it is named for; NAKs the REQUEST the way QEMU does and
+times the restart; stops answering and times the client giving up; and grants
+leases of a few seconds — with and without a mask and a router, with options
+padded and split across repeats, with routers that must be ignored — and times
+their ends: one counted from its REQUEST while its ACK is held back, one while a
+flood of frames keeps the receive ring full. The second leases 10.0.2.42/16 with
+a list of 63 routers, 10.0.2.3 first, and checks the machine answers there and
+not at 10.0.2.15. The third runs alongside them on the wrap kernel, whose tick counter
+starts ten seconds short of 2^32, and times the DISCOVER backoff out to its
+64-second cap, across the wrap. `tcpdump` re-decodes every DHCP message the
+guest sent, one message at a time. `make warnings` builds everything at five
+optimisation levels with the warning gate as errors — at `-O0` a 64-bit
+division becomes a call into libgcc, which is not linked, and only that level
+shows it.
 
 ## What it does
 
@@ -158,9 +200,11 @@ checked for the datagram arriving, and a size sweep.
 | **Network driver** (ring 3) | An RTL8139, driven entirely from user space. The driver walks the PCI bus (ports `0xCF8`/`0xCFC`) to find vendor `0x10EC` device `0x8139`, reads its I/O base and IRQ, allocates a contiguous DMA receive ring, programs the card over I/O ports under IOPL=3, and claims the discovered IRQ; each receive interrupt is forwarded to it as a `MSG_HARDWARE_INTERRUPT`, and it reads the packet straight out of the DMA ring |
 | **DMA / dynamic IRQ** | `sys_alloc_dma(pages, *phys)` hands a driver contiguous, zeroed, pinned physical frames and their physical address, which a device's DMA engine needs (the only call that *allocates* memory to hand back its physical address; `sys_grant_info` reports one the loader placed). `sys_claim_irq(irq)` routes a line discovered at run time to the caller. Both are driver-only, gated on the same capability as I/O |
 | **Ethernet (layer 2)** | Each received frame is parsed where it lies in the DMA ring: a `__attribute__((packed))` 14-byte header cast over the first byte past the card's own 4-byte prefix, source and destination MAC formatted as six zero-padded hex bytes, and the EtherType read through `ntohs` and named — IPv4, ARP, IPv6, or left as the bare number. A frame too short to hold a header is reported and skipped without breaking the drain |
-| **Transmit / ARP** | Four transmit descriptors over two DMA pages split into 1536-byte buffers — room for a full 1514-byte frame — used strictly in order: the driver copies a frame in, hands the card that buffer's physical address, and writes the length to start the send, padding anything under 60 bytes with zeroes. On top of it, ARP: a request for `10.0.2.15` is answered with a reply built in its own buffer from the request — opcode flipped, sender and target swapped, every multi-byte field through `htons`/`htonl` — and a request for any other address is ignored |
-| **IPv4 / ICMP echo** | A received IPv4 datagram is validated in an order where every check reads only bytes an earlier one proved present: version and IHL, total length against the header and against the frame (`ntohs`, so Ethernet padding is never mistaken for payload), a 1500-byte cap, the header checksum over the whole header, no fragment, addressed to `10.0.2.15` at the IP layer and to this card's MAC at the Ethernet layer, and from a sane unicast source. An ICMP echo request that passes is answered with a reply built fresh: Ethernet and IP addressed from this machine's own identity, a rebuilt 20-byte IPv4 header, the request's identifier, sequence and data returned unchanged, and both checksums computed with their fields zeroed first (RFC 1071) |
+| **Transmit / ARP** | Four transmit descriptors over two DMA pages split into 1536-byte buffers — room for a full 1514-byte frame — used strictly in order: the driver copies a frame in, hands the card that buffer's physical address, and writes the length to start the send, padding anything under 60 bytes with zeroes. On top of it, ARP: a request for the address DHCP leased this machine is answered — and none at all before a lease — with a reply built in its own buffer from the request — opcode flipped, sender and target swapped, every multi-byte field through `htons`/`htonl` — and a request for any other address is ignored |
+| **IPv4 / ICMP echo** | A received IPv4 datagram is validated in an order where every check reads only bytes an earlier one proved present: version and IHL, total length against the header and against the frame (`ntohs`, so Ethernet padding is never mistaken for payload), a 1500-byte cap, the header checksum over the whole header, no fragment, addressed to the leased address at the IP layer and to this card's MAC at the Ethernet layer (or, for UDP only, to the limited broadcast, which reaches nothing but the DHCP client), and from a sane unicast source. An ICMP echo request that passes is answered with a reply built fresh: Ethernet and IP addressed from this machine's own identity, a rebuilt 20-byte IPv4 header, the request's identifier, sequence and data returned unchanged, and both checksums computed with their fields zeroed first (RFC 1071) |
 | **UDP / echo on port 7** | A UDP segment (RFC 768) is checked in the same read-only-what-is-proven order: room for the 8-byte header, the brief's `UDP Packet \| Port S -> D \| Length: L` line, a length at least the header and at most the datagram (anything between the two is ignored), and a non-zero checksum verified over a 12-byte pseudo-header — both IP addresses, protocol 17, the UDP length copied byte for byte from the header — laid in a static 1,492-byte scratch buffer ahead of the segment; the buffer is sized by the 1500-byte IPv4 cap, so no allocation is needed. The data is previewed on its own line with every non-printable byte shown as `.`. Port 7 echoes it back with the ports swapped, from this machine's own address, through the IPv4 reply builder ICMP shares, and a checksum that comes out as 0 is sent as `0xFFFF`. Source ports below 1024 and 2049 are refused, as OpenBSD's inetd does |
+| **Kernel alarm** | `sys_alarm(ticks)` gives a task one alarm at the 100 Hz tick rate (`SYS_ALARM_HZ`, the rate the timer is programmed at): when it expires, the task's next `recv` returns a `MSG_TIMER` from the kernel, ahead of interrupts and messages. It is a flag in the control block, like a forwarded interrupt, so nothing another process sends can crowd it out; the tick expires alarms with interrupts off and wakes a task blocked in `recv`. Arming or cancelling discards an expiry not yet collected; 2^31 ticks or more is refused and changes nothing. `sys_ticks` reads the clock alarms count in, so a task kept out of `recv` can still see that its alarm is due. Tested on its own by `alarmtest.elf` |
+| **DHCP client** (RFC 2131) | The machine boots at 0.0.0.0 and leases its address, mask and router: DISCOVER, OFFER, REQUEST, ACK on UDP 68/67, one xid throughout, broadcast both ways. Every reply is checked — source port 67, op, htype, hlen, the xid, the client's own hardware address, the magic cookie through `htonl`/`ntohl` — and its options walked with every byte proved inside the message before it is read, End required, repeats concatenated (RFC 3396), overload refused. The offered address, mask (contiguous, /8 to /30) and router (on the subnet, not the network or broadcast address, not the lease) are judged before anything is used, and the ACK judged again. DISCOVER is retransmitted at 4, 8, 16, 32 and then every 64 s, REQUEST four times before the client starts over, all ±1 s on the kernel alarm; every restart — after a NAK, a give-up, a lease's end — waits a second or two; the lease is counted from the REQUEST and ends when it runs out, even while a flood keeps the receive loop busy |
 
 ## Layout
 
@@ -183,7 +227,8 @@ src/drivers/vga.c       the kernel's text driver: clears the screen at boot,
 src/drivers/keyboard.c  the kernel half of the keyboard: drains the controller at
                         boot, hands IRQ1 to the ring-3 driver, drains again if
                         no driver is alive. No scancode table
-src/drivers/pit.c       programmable interval timer, 100 Hz tick hook
+src/drivers/pit.c       programmable interval timer, 100 Hz tick hook; the
+                        counter's start is a build knob for the wrap kernel
 src/mm/pmm.c            physical frame allocator
 src/mm/paging.c         page directory, page tables, map_page, address spaces
 src/mm/paging_enable.S  loads CR3, sets CR0.PG and CR0.WP
@@ -192,11 +237,12 @@ src/mm/shm.c            id -> physical frame registry for shared pages
 src/task/task.c         task control blocks, process creation, physical grants
 src/task/elf.c          ELF32 loader: validates a module, maps its PT_LOAD segments
 src/task/switch.S       context switch and the first-run bootstrap
-src/task/scheduler.c    round robin over runnable tasks; schedule()
+src/task/scheduler.c    round robin over runnable tasks; schedule(); alarms expire
+                        on the tick
 src/sys/syscall.c       int 0x80 dispatcher: send, recv, yield, map_physical,
                         grant_info, shm_map, shm_attach, grant_io, unmask_irq,
                         trust_sender, map_hw_buffer, klog_read, spawn, parent_of,
-                        exit, waitpid, alloc_dma, claim_irq. No print
+                        exit, waitpid, alloc_dma, claim_irq, alarm, ticks. No print
 src/sys/uaccess.c       copy_from_user / copy_to_user with per-page validation
 src/ipc/ipc.c           ipc_send / ipc_recv over per-task mailboxes, the
                         pending-interrupt bits recv turns into messages, and the
@@ -234,10 +280,13 @@ src/user/vga_server/    the console: maps 0xB8000, four virtual terminals, the
 src/user/apps/shell/    the shell: line editing, built-ins, open + load through
                         the VFS server, sys_spawn
 src/user/apps/calc/     the smallest spawnable program: prints and exits
+src/user/apps/alarmtest/ the kernel alarm's own test, run from the shell
 src/user/net_server/    the RTL8139 driver: PCI scan, DMA ring, IRQ claim, RX,
                         Ethernet parsing, transmit (rtl8139.c), ARP (arp.c),
                         IPv4 validation and the reply header (ipv4.c), ICMP
-                        echo (icmp.c) and UDP with the echo service (udp.c)
+                        echo (icmp.c), UDP with the echo service (udp.c), the
+                        DHCP client (dhcp.c) and the leased configuration
+                        (netcfg.c)
 src/user/lib/net.c      byte order (htons/ntohs/htonl/ntohl), the RFC 1071
                         checksum, the Ethernet header writer, and the formatters
                         for MAC addresses, IPv4 addresses and EtherTypes
@@ -245,10 +294,12 @@ include/arch/pci.h      PCI config mechanism #1 (0xCF8/0xCFC) readers
 include/arch/rtl8139.h  RTL8139 register map and bits
 include/net/ethernet.h  the packed 14-byte Ethernet header and EtherTypes
 include/net/arp.h       the packed 28-byte ARP header and opcodes
-include/net/ipv4.h      the packed IPv4 header, its field helpers, and this
-                        machine's hardcoded address, subnet and gateway
+include/net/ipv4.h      the packed IPv4 header, its field helpers, and the
+                        header builders every datagram goes out through
 include/net/icmp.h      the packed ICMP echo header and its types
 include/net/udp.h       the packed UDP header and pseudo-header, and the ports
+include/net/dhcp.h      the packed 236-byte BOOTP/DHCP header, the cookie, options
+include/net/netcfg.h    the leased configuration: address, mask, router, lease
 include/net/checksum.h  the Internet checksum's contract, and why one's complement
 include/net/rtl8139.h   the driver module's own interface: transmit and the
                         card's MAC (include/arch/rtl8139.h is the register map)
@@ -263,6 +314,9 @@ tools/ping.py           plays the host for `make ping`: echo requests in, every
                         reply checked, refusals tested, liveness after each
 tools/udp_echo.py       plays the host for `make udp`: datagrams to port 7,
                         every echo checked, refusals, the console read back
+tools/dhcp_test.py      `make dhcp`: the only DHCP server on the guest's segment,
+                        three boots (one on the wrap kernel), every refusal
+                        and timer of the client
 tools/udp_host.py       `make udp-host`: the host's own nc through QEMU's
                         user-mode network and its port forward
 tools/check_checksum.py builds net.c natively and checks net_checksum against
@@ -642,6 +696,56 @@ zero rule, the port swap, a missing `ntohs`, a reply sent to the wrong host —
 and every one that can be caught is caught by the case named for it; two
 guards nothing can reach are shown to be exactly that.
 
+**26. Asking for an address.** Until now the machine's address was a constant:
+10.0.2.15, a /24 and a gateway, written into the address checks, the ARP answers
+and every reply header. Now it boots with none and asks. DHCP is four messages —
+DISCOVER, OFFER, REQUEST, ACK — all broadcast here, because the client asks for
+that (the BROADCAST flag) and accepts no unicast until it has an address, and all
+carrying the transaction id the client picked.
+The machine answers nothing until the ACK: no ARP, no ping, no echo, not even at
+0.0.0.0, since an address it has not been given is not one it may answer for.
+IPv4 gains exactly one way in for a broadcast — UDP to 255.255.255.255, which
+UDP hands only to the DHCP client — so the echo service and ICMP still never
+answer one.
+
+The question this phase was asked is how to walk DHCP's options, which are
+`[code][length][data]` records ended by an End option, safely enough to pull the
+subnet mask and the router out of a stranger's message. One cursor walks from
+after the magic cookie to where the UDP payload ends — a bound the IP and UDP
+layers have already proved lies inside the frame — and every byte is proved
+inside before it is read: a code byte, then, unless it is Pad or End, a length
+byte, then the length checked against what is left as `len > end − p` (never
+`p + len > end`, which would form a pointer past the object). Unknown options are
+stepped over by their length; End is required, and nothing after it is read;
+options that repeat are concatenated, as RFC 3396 says, and their lengths
+checked on the total. Nothing the options say is used until the whole message
+has parsed and the offered address, mask and router have been judged — so a
+message malformed at its fortieth option has configured nothing.
+
+Retransmission needs time, and ring 3 had none: the network server woke only
+for its card. So the kernel gained an alarm, `sys_alarm`, delivered the way a
+forwarded interrupt is — a flag in the control block that `recv` turns into a
+`MSG_TIMER` from the kernel — and the client resends on it with RFC 2131's
+randomised backoff, gives up on a silent server and starts over, restarts a
+second or two after a NAK, and drops its address when the lease runs out —
+counted, as RFC 2131 says, from when the REQUEST went out, which needed a clock
+ring 3 could read: `sys_ticks`. The clock also closed a hole the review found:
+a flood of frames kept the network server draining its receive ring, never
+back in `recv` where the alarm is delivered, so a lease outlived its end for as
+long as the flood lasted. The receive loop now asks the client, before every
+frame, whether its alarm is due. Every restart waits a second or two, so no
+server, however it answers, can make the client transmit faster. The
+alarm has its own test program, because a DHCP exchange cannot aim at the cases
+that matter: an alarm expiring while its owner is busy, then cancelled before
+it looks. The xid comes from the timestamp counter, mixed with the MAC; there is
+no other entropy in the machine, and the xid needs to be unique, not secret —
+every message carrying it is broadcast.
+
+Against QEMU's own DHCP server the whole exchange takes about five
+milliseconds. `make dhcp` plays a server that tries to break it instead, and
+leases a second boot 10.0.2.42/16 to prove the address is the one leased and not
+a constant.
+
 Every phase was reviewed adversarially afterwards, by building variants and
 booting them, and the reviews found real defects in most of them: a page
 directory that was never zeroed, a buffer overflow in a directory listing, an
@@ -697,7 +801,10 @@ one caused, or would have caused, a real bug.
   the list silently turns coalescing into corruption.
 - **`sizeof` the heap header must stay a multiple of `KHEAP_ALIGNMENT`**, or
   every payload drifts out of alignment as the chain grows. A `_Static_assert`
-  fails the build rather than letting that happen quietly.
+  fails the build rather than letting that happen quietly. It is also what lets
+  `kfree` refuse a pointer that is not `KHEAP_ALIGNMENT`-aligned: every payload
+  is, so such a pointer is none, and the header in front of it would be
+  misaligned too.
 - **A message never moves user-to-user in one motion.** `send` copies the
   sender's buffer into the *receiver's* kernel-owned mailbox; `recv` copies that
   mailbox into the receiver's own buffer when it wakes. Each half validates
@@ -1074,7 +1181,7 @@ one caused, or would have caused, a real bug.
   every exit from the drain moves `CAPR`, and the first version broke it the same
   way: by returning without moving anything.
 - **A driver answers only for the address it owns.** An ARP request whose target
-  is not `10.0.2.15` gets no reply. Answering for addresses you do not hold is
+  is not the leased address gets no reply, and before a lease none does. Answering for addresses you do not hold is
   how a machine hijacks traffic on a segment, and the check that prevents it is
   one comparison, in host order on both sides.
 - **A checksum is verified on the way in and computed with its field zeroed on
@@ -1088,15 +1195,16 @@ one caused, or would have caused, a real bug.
   "none". An outgoing one is summed with its checksum field set to zero
   first, because the checksum is defined over the header as if that field were
   zero — computing it with the old value still there sums garbage in. The outbound side is re-checked by an implementation this project
-  did not write: `tcpdump` reads every frame the guest sent during `make ping`
-  and `make udp` and checks each checksum, and the UDP gate counts a missing
+  did not write: `tcpdump` reads every frame the guest sent during `make ping`,
+  `make udp` and `make dhcp` and checks each checksum, and the UDP gate counts a missing
   checksum as a failure. The inbound side — that the guest refuses what it
   should — is tested by requests with deliberately wrong checksums, built with
   the tools' own RFC-derived reference.
 - **A reply goes only to a single, ordinary unicast host.** The
   card is promiscuous, so frames for the whole segment arrive; only those sent
   to this card's MAC or to broadcast are handed above layer 2, and IPv4 then
-  insists on this machine's own MAC and address. A request from a broadcast, multicast, loopback, reserved source, anything in
+  insists on this machine's own MAC and leased address — the one exception
+  being UDP to the limited broadcast, which reaches only the DHCP client. A request from a broadcast, multicast, loopback, reserved source, anything in
   0.0.0.0/8, the subnet's own address, or this machine's own address is dropped:
   RFC 1122 requires it, and the reply would be a datagram no host may send.
   Fan-out on the segment is prevented by a different check — a source MAC that
@@ -1113,6 +1221,30 @@ one caused, or would have caused, a real bug.
   echo still leaves from port 7, a privileged port, so it does not stop chosen
   bytes reaching some other service that trusts a privileged source port, nor a
   loop with a reflector on an ordinary high port (see Known limitations).
+- **An alarm is a flag, and it comes out first.** An expired alarm is not a
+  message in the task's mailbox, which any process could fill; it is a flag the
+  tick sets, which `recv` turns into a `MSG_TIMER` ahead of interrupts and
+  messages. Ahead of interrupts because it is one-shot and cannot starve a
+  device, while a busy device re-raising its line would postpone the alarm for
+  as long as traffic arrived. That order is not enough on its own: a task can
+  be kept out of `recv` altogether — the network server, draining a ring a
+  flood keeps full — so the DHCP client also keeps its own deadline, read
+  against `sys_ticks`, and the receive loop asks before every frame whether it
+  is due. Arming or cancelling clears an expiry not yet
+  collected, so a cancelled alarm never arrives late. The message is zeroed
+  before it is filled: it is built on the kernel stack and copied to ring 3.
+- **A stranger's options are walked, never trusted.** Every byte of a DHCP
+  message's options is proved to lie before the end of the message — a bound
+  the IP and UDP layers established — before it is read; End is required;
+  lengths are checked on the concatenated total; and nothing is used until the
+  whole message has parsed and made sense. The same rule as every other parser
+  here, applied to the first variable-length structure.
+- **No address, no answers — before the lease, and after it.** Until a lease is
+  bound the machine answers no ARP, no ping and no echo, not even at 0.0.0.0. A
+  lease runs from when its REQUEST went out (RFC 2131 4.4.1), not from when the
+  ACK arrived, so a late ACK cannot stretch it, and one already over is refused;
+  when it runs out the machine stops answering at once (4.4.5), flood or not. A
+  broadcast is accepted only as UDP and delivered only to the DHCP client.
 
 ## Known limitations
 
@@ -1143,9 +1275,10 @@ These are deliberate boundaries, not oversights:
   writing, no creation or deletion. `readdir` returns a pointer to a single
   shared `dirent`, which is safe only while the kernel is single-threaded.
 - **Only one filesystem can be mounted**, at `/`. There is no mount table.
-- **IPC is single-slot and untimed.** A mailbox holds one unread message; a
-  second `send` returns `IPC_ERR_FULL` rather than queueing, and `recv` blocks
-  with no timeout. Pids are assigned in creation order, never reused, and the
+- **IPC is single-slot, and waits with no timeout of its own.** A mailbox holds
+  one unread message; a second `send` returns `IPC_ERR_FULL` rather than
+  queueing, and `recv` blocks until something arrives — a task that wants to
+  stop waiting sets an alarm first. Pids are assigned in creation order, never reused, and the
   demo hardcodes the receiver's.
 - **The loader is eager and non-relocating.** The whole image is read into the
   heap and copied into frames up front: no demand paging, no `mmap`, and no
@@ -1313,23 +1446,23 @@ These are deliberate boundaries, not oversights:
   frame whose send timed out. QEMU never gets here on its own; the path was
   exercised by desynchronising the card's pointer from the monitor.
 - **ARP answers, but remembers nothing.** There is no ARP cache: a reply is
-  built, sent and forgotten. The IP layer above it only ever replies, and a
-  reply goes to the source MAC of the frame that asked, so nothing looks an
-  address up — which also means no datagram this machine originates could find
-  its way anywhere yet. The machine's IP address is a compile-time constant
-  (`10.0.2.15`) because there is no DHCP client to learn one, and it answers for
-  that single address only.
-- **IPv4 is receive-and-reply only.** No fragment is reassembled — one is dropped,
+  built, sent and forgotten. Every reply goes to the MAC the request came from,
+  and what the machine originates — DHCP, and one ARP request for its router —
+  is broadcast, so nothing looks an address up. It answers for the single
+  address it leased, for none before that, and never to a request whose sender
+  MAC is a group address, which would make the answer a broadcast.
+- **IPv4 routes nothing and reassembles nothing.** No fragment is reassembled — one is dropped,
   which RFC 1122 does not allow a host but which is honest about there being no
   reassembly buffer. Options are accepted and stepped over but not returned:
   RFC 1122 asks for Record Route and Timestamp to be updated in an echo reply and
   a source route to be reversed, and this one sends a plain 20-byte header
-  instead. Nothing is routed, and no datagram is originated except a reply.
+  instead. Nothing is routed, and the only datagrams originated rather than
+  answered are the DHCP client's broadcasts.
 - **ICMP is echo and nothing else.** Only echo requests are answered; every other
   type is logged and ignored, and no ICMP error — destination unreachable,
   parameter problem — is ever generated, so a malformed datagram is dropped
   without telling the sender why.
-- **Nothing above IPv4 but ICMP echo and UDP echo.** No TCP: a datagram for any
+- **Nothing above IPv4 but ICMP echo, UDP echo and the DHCP client.** No TCP: a datagram for any
   other protocol passes every IPv4 check and is then reported as something
   nothing here speaks. The CRC the card appends is subtracted from the length
   and otherwise ignored. No other process can receive a frame or a datagram
@@ -1350,7 +1483,7 @@ These are deliberate boundaries, not oversights:
   through the port forward — `nc -u 127.0.0.1 7007`, never `10.0.2.15` — and
   `make qemu` now fails to start if that port is taken.
 - **UDP has one service, and no way to say a port is closed.** A datagram to any
-  port but 7 is logged and dropped; RFC 1122 says a host SHOULD answer it with
+  port but 7 (and 68, the DHCP client's) is logged and dropped; RFC 1122 says a host SHOULD answer it with
   an ICMP port-unreachable, and none is generated. Every RFC 1122 MUST about
   the application interface is unmet, for want of an application to deliver
   to: IP options are not passed up with a datagram nor settable on one sent
@@ -1366,14 +1499,39 @@ These are deliberate boundaries, not oversights:
   127.0.0.1:7007, and one datagram it sends from there reaches the guest as
   10.0.2.2:7007, whose echo QEMU hands straight back to the guest — a loop of
   a few thousand frames a second that runs until QEMU exits, with the sender
-  long gone. The usual remedy is a rate limit, and there is no clock in ring 3
-  to build one on.
+  long gone. The usual remedy is a rate limit; the kernel alarm could now pace
+  one, and none is built.
 - **Every echo comes from a privileged port.** The echo always leaves from port
   7, carrying bytes the sender chose, to any unicast address a forged request
   names and any port but those below 1024 and 2049. A service on an ordinary
   port that trusts a client for sending from a privileged port can therefore
   still be handed chosen bytes. OpenBSD's inetd, whose rule this is, has the
   same exposure; the remedy is not to run echo where such services listen.
+- **A lease is taken, and then taken again.** There is no RENEWING or REBINDING:
+  when a lease runs out the address is dropped and, a second or two later, a
+  new DISCOVER sent, so under QEMU there is a gap of one to two seconds every
+  24 hours. A lease longer than about 248 days is timed in pieces, which no test
+  can wait for. The tick is not quite 100 Hz — the PIT's whole-number divisor
+  makes it 100.007 — so every alarm ends 69 parts per million early, and a
+  day's lease about six seconds early: the safe side.
+- **The first OFFER wins, and the address is not checked.** No ARP probe before
+  using the address, so no DHCPDECLINE if another host holds it — not even the
+  server itself: an offer of the server's own address is believed. No INIT-REBOOT
+  to ask for the previous address; no DHCPRELEASE; and option overload (52) is
+  refused, not parsed. `secs` is always 0.
+- **A server that ignores the BROADCAST flag is not heard.** Before a lease the
+  machine accepts no unicast at all, though RFC 2131 (section 2) says a client
+  SHOULD accept a datagram sent to its hardware address before its IP address
+  is configured; it relies on the flag it sets, which QEMU honours by always
+  broadcasting.
+- **The transaction id is unique, not secret.** It comes from the timestamp
+  counter mixed with the MAC. Anyone on the segment sees it in the broadcast
+  DISCOVER and REQUEST, so a host there can forge an OFFER, an ACK or a NAK the
+  client will take — as it can for any DHCP client; what is checked is that it
+  is at least for this client, this transaction, the state it is in, and
+  self-consistent. A forger cannot make the client transmit faster than it
+  would anyway: a lease already over is refused, and every restart — after a
+  NAK, a give-up or a lease's end — waits a second or two first.
 
 ## License
 
